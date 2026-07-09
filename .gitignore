@@ -90,10 +90,6 @@ docs/
 deployment/
 deploy/
 
-# Scripts
-*.sh
-*.bat
-
 # Docker
 Dockerfile*
 docker-compose*
