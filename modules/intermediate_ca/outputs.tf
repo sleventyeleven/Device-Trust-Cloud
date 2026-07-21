@@ -4,64 +4,31 @@ output "intermediate_ca_id" {
 }
 
 output "intermediate_ca_name" {
-  description = "Name of the intermediate CA"
+  description = "Resource name of the intermediate CA"
   value       = google_privateca_certificate_authority.intermediate_ca.name
-}
-
-output "intermediate_ca_issuer_url" {
-  description = "Issuer certificate URL for the intermediate CA"
-  value       = google_privateca_certificate_authority.intermediate_ca.issuer_certificate_url
-}
-
-output "intermediate_ca_issuer_certificate" {
-  description = "Issuer certificate for the intermediate CA"
-  value       = google_privateca_certificate_authority.intermediate_ca.issuer_certificate
-  sensitive   = true
-}
-
-output "intermediate_ca_certificate" {
-  description = "Intermediate CA certificate content"
-  value       = google_privateca_certificate_authority.intermediate_ca.certificates[0]
-  sensitive   = true
 }
 
 output "intermediate_ca_pem_certificate" {
   description = "PEM-encoded intermediate CA certificate"
-  value       = one(google_privateca_certificate_authority.intermediate_ca.certificates)
-  sensitive   = true
-}
-
-output "intermediate_ca_pem_private_key" {
-  description = "PEM-encoded intermediate CA private key"
-  value       = null
+  value       = google_privateca_certificate_authority.intermediate_ca.pem_ca_certificates[0]
   sensitive   = true
 }
 
 output "intermediate_ca_public_certificate" {
-  description = "PEM-encoded public certificate"
-  value       = one(google_privateca_certificate_authority.intermediate_ca.certificates)
-  sensitive   = false
+  description = "PEM-encoded public intermediate CA certificate"
+  value       = google_privateca_certificate_authority.intermediate_ca.pem_ca_certificates[0]
 }
 
 output "intermediate_ca_issuing_ca" {
-  description = "Issuing CA (parent root CA)"
-  value       = google_privateca_certificate_authority.root_ca.name
+  description = "Issuing CA (parent root CA) resource name"
+  value       = var.parent_ca_resource_name
 }
 
 output "intermediate_ca_pem_chain" {
-  description = "Complete PEM-encoded certificate chain (root + intermediate)"
+  description = "Complete PEM-encoded certificate chain (intermediate + root)"
   value       = join("\n", [
-    one(google_privateca_certificate_authority.root_ca.certificates),
-    one(google_privateca_certificate_authority.intermediate_ca.certificates)
+    google_privateca_certificate_authority.intermediate_ca.pem_ca_certificates[0],
+    var.root_ca_pem_certificate,
   ])
-  sensitive   = true
-}
-
-output "intermediate_ca_public_chain" {
-  description = "Complete PEM-encoded public certificate chain"
-  value       = join("\n", [
-    one(google_privateca_certificate_authority.root_ca.certificates),
-    one(google_privateca_certificate_authority.intermediate_ca.certificates)
-  ])
-  sensitive   = false
+  sensitive = true
 }

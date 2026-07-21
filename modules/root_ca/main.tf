@@ -1,9 +1,11 @@
 # Root CA Module
-# Creates a root Certificate Authority with 10-year lifetime and deletion protection
+# Creates a self-signed root Certificate Authority with 10-year lifetime and deletion protection
 
 resource "google_privateca_certificate_authority" "root_ca" {
-  pool = google_privateca_ca_pool.root_pool.name
+  pool                     = var.root_ca_pool_name
   certificate_authority_id = var.root_ca_name
+  location                 = var.location
+  type                     = "SELF_SIGNED"
 
   # Key specification
   key_spec {
@@ -16,30 +18,30 @@ resource "google_privateca_certificate_authority" "root_ca" {
   # Deletion protection for security
   deletion_protection = true
 
+  # Publish CA certificate/CRLs to a Cloud Storage bucket (optional)
+  gcs_bucket = var.root_ca_gcs_bucket != "" ? var.root_ca_gcs_bucket : null
+
   # CA configuration
-  subject {
-    common_name = var.root_ca_name
-    organization = "Device Trust Infrastructure"
-    country = "US"
+  config {
+    subject_config {
+      subject {
+        common_name  = var.root_ca_name
+        organization = "Device Trust Infrastructure"
+      }
+    }
+
+    x509_config {
+      ca_options {
+        is_ca = true
+      }
+
+      key_usage {
+        base_key_usage {
+          cert_sign = true
+          crl_sign  = true
+        }
+        extended_key_usage {}
+      }
+    }
   }
-
-  # Publishing configuration
-  publishing_config {
-    # Optional: Publish to Cloud Storage
-    gcs_bucket = var.root_ca_gcs_bucket
-  }
-
-  # Activate the CA
-  activate = true
-
-  description = "Root Certificate Authority for Device Trust"
-}
-
-# Grant IAM roles for root CA
-# This is typically done by step-ca service account
-resource "google_privateca_certificate_authority_iam_binding" "bind_issuer" {
-  certificate_authority_id = google_privateca_certificate_authority.root_ca.certificate_authority_id
-  role = "roles/privateca.issuer"
-
-  members = var.root_ca_iam_members
 }

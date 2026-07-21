@@ -26,11 +26,24 @@ resource "google_cloud_run_service" "stepca" {
   name     = var.stepca_service_name
   location = var.location
 
+  metadata {
+    annotations = {
+      "run.googleapis.com/launch-stage" = "BETA"
+    }
+  }
+
   template {
     metadata {
-      annotations = {
-        "run.googleapis.com/launch-stage" = "BETA"
-      }
+      annotations = merge(
+        {
+          "autoscaling.knative.dev/minScale" = tostring(var.min_instances)
+          "autoscaling.knative.dev/maxScale" = tostring(var.max_instances)
+        },
+        var.vpc_connector_enabled ? {
+          "run.googleapis.com/vpc-access-connector" = var.vpc_connector_name
+          "run.googleapis.com/vpc-access-egress"     = "private-ranges-only"
+        } : {}
+      )
     }
 
     spec {
@@ -108,55 +121,18 @@ resource "google_cloud_run_service" "stepca" {
       # Container concurrency
       container_concurrency = 80
 
-      # VPC connector
-      dynamic "vpc_access_connector" {
-        for_each = var.vpc_connector_enabled ? ["true"] : []
-        content {
-          network_connector = var.vpc_connector_name
-          egress_mode = "PRIVATE_RFC1918"
-        }
-      }
+      # Request timeout
+      timeout_seconds = 600
     }
   }
 
   # Traffic configuration
   traffic {
-    percent      = 100
-    type         = "TRAFFIC_TARGET_TYPE_ALL"
+    percent         = 100
     latest_revision = true
   }
 
-  # Minimum/maximum instances
-  min_instances = var.min_instances
-  max_instances = var.max_instances
-
-  # Ingress
-  ingress = "INGRESS_TRAFFIC_ALL"
-
-  # Enable all traffic
-  all_traffic = var.all_traffic
-
-  # Timeout
-  timeout = "600s"
-
-  # Health check
-  {%- if var.health_check_enabled -%}
-  custom_health_checks {
-    check_path = "/.well-known/step-ca/healthz"
-    startup_probe = {
-      period_seconds = 10
-      timeout_seconds = 1
-      success_threshold = 1
-      failure_threshold = 3
-    }
-    liveness_probe = {
-      period_seconds = 10
-      timeout_seconds = 1
-      success_threshold = 1
-      failure_threshold = 3
-    }
-  }
-  {%- endif -%}
+  autogenerate_revision_name = true
 }
 
 # Grant IAM roles for step-ca to access Private CA resources

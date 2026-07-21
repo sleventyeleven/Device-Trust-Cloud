@@ -3,15 +3,14 @@
 
 # Allowlisted IPs for SCEP access
 resource "google_compute_address" "scep_address" {
-  name = "${var.scep_endpoint_name}-address"
+  name   = "${var.scep_endpoint_name}-address"
   region = var.region
 }
 
 # Load Balancer
 resource "google_compute_target_tcp_proxy" "scep_proxy" {
-  name = "${var.scep_endpoint_name}-proxy"
+  name            = "${var.scep_endpoint_name}-proxy"
   backend_service = google_compute_backend_service.scep_backend.id
-  port_name = "scep"
 }
 
 # Health check
@@ -19,15 +18,15 @@ resource "google_compute_health_check" "scep_health_check" {
   name = "${var.scep_endpoint_name}-health-check"
 
   tcp_health_check {
-    port = "80"
+    port = 80
   }
 }
 
 # Backend service
 resource "google_compute_backend_service" "scep_backend" {
-  name = "${var.scep_endpoint_name}-backend"
-  protocol = "TCP"
-  port_name = "scep"
+  name          = "${var.scep_endpoint_name}-backend"
+  protocol      = "TCP"
+  port_name     = "scep"
   health_checks = [google_compute_health_check.scep_health_check.id]
 
   backend {
@@ -35,9 +34,7 @@ resource "google_compute_backend_service" "scep_backend" {
   }
 
   # Connection draining
-  connection_draining {
-    draining_timeout = var.connection_draining_timeout
-  }
+  connection_draining_timeout_sec = var.connection_draining_timeout
 
   # Timeout
   timeout_sec = var.backend_timeout_sec
@@ -70,9 +67,9 @@ resource "google_compute_instance" "scep_instance" {
   }
 
   network_interface {
-    network = var.network_name
+    network    = var.network_name
     subnetwork = var.subnet_name
-    access_configs {
+    access_config {
       # Ephemeral IP
     }
   }
@@ -102,7 +99,7 @@ resource "google_compute_instance" "scep_instance" {
   }
 
   service_account {
-    email = google_service_account.sa_stepca.email
+    email  = var.service_account_email
     scopes = ["https://www.googleapis.com/auth/cloud-platform"]
   }
 
@@ -111,11 +108,11 @@ resource "google_compute_instance" "scep_instance" {
 
 # Network load balancer
 resource "google_compute_global_forwarding_rule" "scep_forwarding_rule" {
-  name = "${var.scep_endpoint_name}-forwarding-rule"
+  name                  = "${var.scep_endpoint_name}-forwarding-rule"
   load_balancing_scheme = "EXTERNAL"
-  ip_protocol = "TCP"
-  port_range = "80"
-  ip_address = google_compute_address.scep_address.address
+  ip_protocol           = "TCP"
+  port_range            = "80"
+  ip_address            = google_compute_address.scep_address.address
 
   target = google_compute_target_tcp_proxy.scep_proxy.id
 
@@ -130,7 +127,7 @@ resource "google_compute_firewall" "scep_firewall" {
 
   allow {
     protocol = "tcp"
-    ports = ["80"]
+    ports    = ["80"]
   }
 
   source_ranges = var.scep_allowed_ips
@@ -142,13 +139,14 @@ resource "google_compute_firewall" "scep_firewall" {
 
 # IAM binding for SCEP endpoint
 resource "google_compute_instance_iam_binding" "bind_scep" {
-  instance = google_compute_instance.scep_instance.name
-  role = "roles/compute.instanceAdmin"
+  instance_name = google_compute_instance.scep_instance.name
+  zone          = var.zone
+  role          = "roles/compute.instanceAdmin"
 
   members = var.scep_iam_members
 }
 
-# Optional: ACME challenge integration
+# Autoscaler for the SCEP instance group
 resource "google_compute_autoscaler" "scep_autoscaler" {
   name = "${var.scep_endpoint_name}-autoscaler"
   zone = var.zone
@@ -156,20 +154,12 @@ resource "google_compute_autoscaler" "scep_autoscaler" {
   target = google_compute_instance_group.scep_instance_group.id
 
   autoscaling_policy {
-    max_instances = var.autoscale_max_instances
-    min_instances = var.autoscale_min_instances
+    max_replicas    = var.autoscale_max_instances
+    min_replicas    = var.autoscale_min_instances
     cooldown_period = var.autoscale_cooldown_period
 
-    custom_metric_specs {
-      metric {
-        name = "autoscale_custom_metric"
-        multiplier = 1.0
-        type = "compute.googleapis.com/instance_count"
-      }
-      distribution_policy {
-        uniform {
-        }
-      }
+    cpu_utilization {
+      target = 0.6
     }
   }
 }

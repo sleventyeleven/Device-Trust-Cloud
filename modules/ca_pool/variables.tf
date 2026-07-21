@@ -33,3 +33,15 @@ variable "location" {
   type        = string
   default     = "us-central1"
 }
+
+variable "root_ca_pool_iam_members" {
+  description = "List of IAM members granted roles/privateca.issuer on the root CA pool"
+  type        = list(string)
+  default     = []
+}
+
+variable "ca_pool_iam_members" {
+  description = "List of IAM members granted roles/privateca.issuer and roles/privateca.templateUser on the CA pool"
+  type        = list(string)
+  default     = []
+}

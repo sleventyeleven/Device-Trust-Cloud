@@ -4,53 +4,23 @@ output "root_ca_id" {
 }
 
 output "root_ca_name" {
-  description = "Name of the root CA"
+  description = "Resource name of the root CA (used as the parent reference for subordinate CAs)"
   value       = google_privateca_certificate_authority.root_ca.name
-}
-
-output "root_ca_issuer_url" {
-  description = "Issuer certificate URL for the root CA"
-  value       = google_privateca_certificate_authority.root_ca.issuer_certificate_url
-}
-
-output "root_ca_issuer_certificate" {
-  description = "Issuer certificate for the root CA"
-  value       = google_privateca_certificate_authority.root_ca.issuer_certificate
-  sensitive   = true
-}
-
-output "root_ca_certificate" {
-  description = "Root CA certificate content"
-  value       = google_privateca_certificate_authority.root_ca.certificates[0]
-  sensitive   = true
 }
 
 output "root_ca_pem_certificate" {
   description = "PEM-encoded root CA certificate"
-  value       = one(google_privateca_certificate_authority.root_ca.certificates)
+  value       = google_privateca_certificate_authority.root_ca.pem_ca_certificates[0]
   sensitive   = true
 }
 
-output "root_ca_private_key" {
-  description = "Root CA private key (only if generated)"
-  value       = null
-  sensitive   = true
-}
-
-output "root_ca_pem_private_key" {
-  description = "PEM-encoded root CA private key"
-  value       = null
-  sensitive   = true
-}
-
-output "root_ca_crl" {
-  description = "Root CA CRL"
-  value       = null
+output "root_ca_pem_certificate_chain" {
+  description = "PEM-encoded root CA certificate chain"
+  value       = google_privateca_certificate_authority.root_ca.pem_ca_certificates
   sensitive   = true
 }
 
 output "root_ca_public_certificate" {
-  description = "PEM-encoded public certificate"
-  value       = one(google_privateca_certificate_authority.root_ca.certificates)
-  sensitive   = false
+  description = "PEM-encoded public root CA certificate"
+  value       = google_privateca_certificate_authority.root_ca.pem_ca_certificates[0]
 }

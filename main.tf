@@ -3,17 +3,6 @@
 
 # Enable Terraform Cloud logging
 terraform {
-  cloud {
-    organization = "device-trust"
-
-    workspaces {
-      name = "device-trust-pki"
-    }
-  }
-}
-
-# Enable Terraform Cloud logging
-terraform {
   backend "gcs" {
     bucket  = "device-trust-terraform-state"
     prefix  = "terraform-state"
@@ -44,6 +33,10 @@ module "ca_pool" {
   enable_root_publishing = var.enable_root_publishing
   enable_publishing  = var.enable_publishing
   location           = var.location
+
+  # IAM on Private CA is granted at the CA pool level; step-ca is the consumer that issues certificates
+  root_ca_pool_iam_members = concat(["serviceAccount:${module.stepca.service_account_email}"], var.stepca_iam_members)
+  ca_pool_iam_members      = concat(["serviceAccount:${module.stepca.service_account_email}"], var.stepca_iam_members)
 }
 
 # Import the root CA module
@@ -51,11 +44,10 @@ module "root_ca" {
   source = "./modules/root_ca"
 
   root_ca_name         = var.root_ca_name
-  root_ca_pool_name    = var.root_ca_pool_name
+  root_ca_pool_name    = module.ca_pool.root_ca_pool_name
   key_algorithm        = var.root_ca_key_algorithm
   lifetime             = var.root_ca_lifetime
   root_ca_gcs_bucket   = var.root_ca_gcs_bucket
-  root_ca_iam_members  = var.root_ca_iam_members
   location             = var.location
 }
 
@@ -64,11 +56,11 @@ module "intermediate_ca" {
   source = "./modules/intermediate_ca"
 
   intermediate_ca_name    = var.intermediate_ca_name
-  ca_pool_name            = var.ca_pool_name
-  root_ca_name            = var.root_ca_name
+  ca_pool_name            = module.ca_pool.ca_pool_name
+  parent_ca_resource_name = module.root_ca.root_ca_name
+  root_ca_pem_certificate = module.root_ca.root_ca_pem_certificate
   key_algorithm           = var.intermediate_ca_key_algorithm
   lifetime                = var.intermediate_ca_lifetime
-  intermediate_ca_iam_members = var.intermediate_ca_iam_members
   location                = var.location
 }
 
@@ -76,31 +68,9 @@ module "intermediate_ca" {
 module "certificate_template" {
   source = "./modules/certificate_template"
 
-  certificate_template_name      = var.certificate_template_name
-  certificate_template_description = var.certificate_template_description
-  location                       = var.location
-  key_algorithm                  = var.certificate_template_key_algorithm
-  key_size                       = var.certificate_template_key_size
-  default_country                = var.default_country
-  default_organization            = var.default_organization
-  default_common_name            = var.default_common_name
-  common_name                    = var.common_name
-  organization                   = var.organization
-  country                        = var.country
-  organizational_unit             = var.organizational_unit
-  locality                       = var.locality
-  province                       = var.province
-  street_address                 = var.street_address
-  postal_code                    = var.postal_code
-  dns_names                      = var.dns_names
-  email_addresses                = var.email_addresses
-  ip_addresses                   = var.ip_addresses
-  uris                           = var.uris
-  valid_idp_ids                  = var.valid_idp_ids
-  permitted_dns_names            = var.permitted_dns_names
-  excluded_dns_names             = var.excluded_dns_names
-  unknown_critical_key_usage_extensions = var.unknown_critical_key_usage_extensions
-  authority_info_access          = var.authority_info_access
+  certificate_template_name         = var.certificate_template_name
+  certificate_template_description  = var.certificate_template_description
+  location                          = var.location
 }
 
 # Import the step-ca container module
@@ -123,8 +93,6 @@ module "stepca" {
   vpc_connector_name              = var.vpc_connector_name
   project_id                      = var.project_id
   location                        = var.location
-  health_check_enabled            = var.health_check_enabled
-  all_traffic                     = var.all_traffic
 }
 
 # Import the SCEP endpoint module
@@ -136,6 +104,7 @@ module "scep_endpoint" {
   scep_ca_certificate            = module.intermediate_ca.intermediate_ca_pem_certificate
   scep_allowed_ips               = var.scep_allowed_ips
   scep_iam_members               = var.scep_iam_members
+  service_account_email          = module.stepca.service_account_email
   machine_type                   = var.machine_type
   zone                           = var.zone
   boot_disk_size                 = var.boot_disk_size
@@ -152,22 +121,6 @@ module "scep_endpoint" {
   subnet_self_link               = module.network.subnet_self_link
 }
 
-# Grant IAM roles to step-ca service account for Private CA access
-# This should be configured in variables.tf or passed as module input
-resource "google_privateca_certificate_authority_iam_binding" "bind_stepca_issuer" {
-  certificate_authority_id = module.root_ca.root_ca_id
-  role = "roles/privateca.issuer"
-
-  members = var.stepca_iam_members
-}
-
-resource "google_privateca_certificate_authority_iam_binding" "bind_stepca_template_user" {
-  certificate_authority_id = module.intermediate_ca.intermediate_ca_id
-  role = "roles/privateca.templateUser"
-
-  members = var.stepca_iam_members
-}
-
 # Optional: DNS validation for ACME
 resource "google_dns_managed_zone" "validation_zone" {
   count = var.acme_validation_enabled ? 1 : 0
@@ -180,8 +133,9 @@ resource "google_dns_managed_zone" "validation_zone" {
 resource "google_dns_record_set" "acme_validation" {
   count = var.acme_validation_enabled ? 1 : 0
 
+  managed_zone = google_dns_managed_zone.validation_zone[0].name
   name = "${var.acme_challenge_token}.${google_dns_managed_zone.validation_zone[0].dns_name}"
   type = "CNAME"
   ttl  = var.acme_validation_ttl
-  rrdatas = [google_compute_address.scep_address.address]
+  rrdatas = [module.scep_endpoint.scep_ip_address]
 }

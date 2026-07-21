@@ -28,12 +28,6 @@ variable "root_ca_gcs_bucket" {
   default     = ""
 }
 
-variable "root_ca_iam_members" {
-  description = "List of IAM member roles for root CA"
-  type        = list(string)
-  default     = []
-}
-
 variable "location" {
   description = "Google Cloud region/zone location"
   type        = string

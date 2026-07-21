@@ -93,15 +93,3 @@ variable "location" {
   type        = string
   default     = "us-central1"
 }
-
-variable "health_check_enabled" {
-  description = "Enable health checks for Cloud Run service"
-  type        = bool
-  default     = true
-}
-
-variable "all_traffic" {
-  description = "Enable all traffic for Cloud Run service"
-  type        = bool
-  default     = true
-}

@@ -27,10 +27,4 @@ resource "google_vpc_access_connector" "connector" {
   machine_type            = var.vpc_connector_machine_type
   min_instances           = var.vpc_connector_min_instances
   max_instances           = var.vpc_connector_max_instances
-
-  description = "VPC connector for Cloud Run connectivity"
-
-  timeout {
-    idle = "600s"
-  }
 }

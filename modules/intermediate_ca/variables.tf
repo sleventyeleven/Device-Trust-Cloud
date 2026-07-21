@@ -10,10 +10,16 @@ variable "ca_pool_name" {
   default     = "device-trust-ca-pool"
 }
 
-variable "root_ca_name" {
-  description = "Name of the root CA to use as parent"
+variable "parent_ca_resource_name" {
+  description = "Resource name of the root CA that issues this intermediate CA (root_ca module's root_ca_name output)"
   type        = string
-  default     = "root-ca"
+}
+
+variable "root_ca_pem_certificate" {
+  description = "PEM-encoded root CA certificate, used to build the full certificate chain output"
+  type        = string
+  sensitive   = true
+  default     = ""
 }
 
 variable "key_algorithm" {
@@ -26,12 +32,6 @@ variable "lifetime" {
   description = "Intermediate CA certificate lifetime in seconds (default: 5 years)"
   type        = string
   default     = "15768000s"  # 5 years
-}
-
-variable "intermediate_ca_iam_members" {
-  description = "List of IAM member roles for intermediate CA"
-  type        = list(string)
-  default     = []
 }
 
 variable "location" {

@@ -28,6 +28,12 @@ variable "scep_iam_members" {
   default     = []
 }
 
+variable "service_account_email" {
+  description = "Email of the service account the SCEP instance runs as"
+  type        = string
+  default     = ""
+}
+
 variable "machine_type" {
   description = "Machine type for SCEP instance"
   type        = string

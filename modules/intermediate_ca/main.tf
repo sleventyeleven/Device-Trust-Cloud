@@ -1,23 +1,21 @@
 # Intermediate CA Module
-# Creates a subordinate Certificate Authority (5-year lifetime) controlled by step-ca
+# Creates a subordinate Certificate Authority (5-year lifetime) issued by the root CA
 
 resource "google_privateca_certificate_authority" "intermediate_ca" {
-  pool = google_privateca_ca_pool.ca_pool.name
+  pool                     = var.ca_pool_name
   certificate_authority_id = var.intermediate_ca_name
+  location                 = var.location
+  type                     = "SUBORDINATE"
 
-  # Subordinate CA configuration
+  # Reference the root CA as the issuer
   subordinate_config {
-    # Reference the root CA
-    certificate_authority = google_privateca_certificate_authority.root_ca.name
-
-    # Key specification
-    key_spec {
-      algorithm = var.key_algorithm
-    }
+    certificate_authority = var.parent_ca_resource_name
   }
 
-  # Type as SUBORDINATE
-  type = "SUBORDINATE"
+  # Key specification
+  key_spec {
+    algorithm = var.key_algorithm
+  }
 
   # CA certificate lifetime (default: 5 years)
   lifetime = var.lifetime
@@ -25,32 +23,28 @@ resource "google_privateca_certificate_authority" "intermediate_ca" {
   # Deletion protection for security
   deletion_protection = true
 
-  # Activate the CA
-  activate = true
-
   # Subject
-  subject {
-    common_name = var.intermediate_ca_name
-    organization = "Device Trust Infrastructure"
-    country = "US"
+  config {
+    subject_config {
+      subject {
+        common_name  = var.intermediate_ca_name
+        organization = "Device Trust Infrastructure"
+      }
+    }
+
+    x509_config {
+      ca_options {
+        is_ca                       = true
+        zero_max_issuer_path_length = true
+      }
+
+      key_usage {
+        base_key_usage {
+          cert_sign = true
+          crl_sign  = true
+        }
+        extended_key_usage {}
+      }
+    }
   }
-
-  description = "Intermediate Certificate Authority for Device Trust"
-}
-
-# Grant IAM roles for intermediate CA
-# This allows step-ca to issue certificates from this CA
-resource "google_privateca_certificate_authority_iam_binding" "bind_issuer" {
-  certificate_authority_id = google_privateca_certificate_authority.intermediate_ca.certificate_authority_id
-  role = "roles/privateca.issuer"
-
-  members = var.intermediate_ca_iam_members
-}
-
-# Grant IAM role for template usage
-resource "google_privateca_certificate_authority_iam_binding" "bind_template_user" {
-  certificate_authority_id = google_privateca_certificate_authority.intermediate_ca.certificate_authority_id
-  role = "roles/privateca.templateUser"
-
-  members = var.intermediate_ca_iam_members
 }

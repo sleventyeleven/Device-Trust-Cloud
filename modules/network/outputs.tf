@@ -5,12 +5,12 @@ output "vpc_self_link" {
 
 output "subnet_self_link" {
   description = "Self-link of the subnet"
-  value       = google_compute_subnet.subnet.self_link
+  value       = google_compute_subnetwork.subnet.self_link
 }
 
 output "subnet_id" {
   description = "ID of the subnet"
-  value       = google_compute_subnet.subnet.id
+  value       = google_compute_subnetwork.subnet.id
 }
 
 output "vpc_connector_self_link" {
@@ -26,4 +26,9 @@ output "vpc_connector_ip_range" {
 output "network_name" {
   description = "Name of the network"
   value       = google_compute_network.vpc.name
+}
+
+output "subnet_name" {
+  description = "Name of the subnet"
+  value       = google_compute_subnetwork.subnet.name
 }

@@ -5,17 +5,12 @@ output "stepca_service_name" {
 
 output "stepca_url" {
   description = "URL for step-ca service"
-  value       = google_cloud_run_service.stepca.status.url[0]
-}
-
-output "stepca_url_no_scheme" {
-  description = "URL without scheme for direct access"
-  value       = google_cloud_run_service.stepca.status.url[0] ? replace(google_cloud_run_service.stepca.status.url[0], "https://", "") : ""
+  value       = google_cloud_run_service.stepca.status[0].url
 }
 
 output "stepca_host" {
   description = "Host for step-ca service"
-  value       = replace(google_cloud_run_service.stepca.status.url[0], "https://", "")
+  value       = replace(google_cloud_run_service.stepca.status[0].url, "https://", "")
 }
 
 output "stepca_port" {
@@ -36,10 +31,5 @@ output "stepca_domain_mapping_url" {
 
 output "stepca_revision" {
   description = "Latest revision of the step-ca service"
-  value       = google_cloud_run_service.stepca.status.traffic[0].revision_name
-}
-
-output "stepca_status" {
-  description = "Status of the step-ca service"
-  value       = google_cloud_run_service.stepca.status[0]
+  value       = google_cloud_run_service.stepca.status[0].latest_ready_revision_name
 }
