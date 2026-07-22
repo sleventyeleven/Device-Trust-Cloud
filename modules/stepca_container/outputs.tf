@@ -1,20 +1,15 @@
-output "stepca_service_name" {
-  description = "Name of the Cloud Run service"
-  value       = google_cloud_run_service.stepca.name
+output "stepca_instance_name" {
+  description = "Name of the step-ca VM"
+  value       = google_compute_instance.stepca.name
 }
 
-output "stepca_url" {
-  description = "URL for step-ca service"
-  value       = google_cloud_run_service.stepca.status[0].url
-}
-
-output "stepca_host" {
-  description = "Host for step-ca service"
-  value       = replace(google_cloud_run_service.stepca.status[0].url, "https://", "")
+output "instance_group_id" {
+  description = "ID of the (unmanaged) instance group containing the step-ca VM, for the gateway's backend service"
+  value       = google_compute_instance_group.stepca.id
 }
 
 output "stepca_port" {
-  description = "Port for step-ca service"
+  description = "Port on which step-ca listens"
   value       = var.stepca_port
 }
 
@@ -24,12 +19,8 @@ output "service_account_email" {
   sensitive   = true
 }
 
-output "stepca_domain_mapping_url" {
-  description = "Domain mapping URL for step-ca"
-  value       = var.managed_domain_enabled && var.stepca_domain != "" ? "https://${var.stepca_domain}" : ""
-}
-
-output "stepca_revision" {
-  description = "Latest revision of the step-ca service"
-  value       = google_cloud_run_service.stepca.status[0].latest_ready_revision_name
+output "scep_challenge_password" {
+  description = "Shared secret SCEP clients must present to enroll"
+  value       = random_password.scep_challenge.result
+  sensitive   = true
 }

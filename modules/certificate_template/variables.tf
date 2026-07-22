@@ -21,3 +21,9 @@ variable "maximum_lifetime" {
   type        = string
   default     = null
 }
+
+variable "certificate_template_iam_members" {
+  description = "List of IAM members granted roles/privateca.templateUser on this certificate template"
+  type        = list(string)
+  default     = []
+}

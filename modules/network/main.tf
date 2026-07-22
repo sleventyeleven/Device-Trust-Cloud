@@ -1,5 +1,5 @@
 # Network Module
-# Creates an isolated VPC with private subnets and VPC connector for Cloud Run
+# Creates an isolated VPC with private subnets for Device Trust PKI services
 
 resource "google_compute_network" "vpc" {
   name                    = var.network_name
@@ -18,13 +18,18 @@ resource "google_compute_subnetwork" "subnet" {
   description = "Private subnet for Device Trust services"
 }
 
-# VPC connector for Cloud Run
-resource "google_vpc_access_connector" "connector" {
-  name                    = var.vpc_connector_name
-  network                 = google_compute_network.vpc.id
-  ip_cidr_range           = "10.8.0.0/28"
-  region                  = var.region
-  machine_type            = var.vpc_connector_machine_type
-  min_instances           = var.vpc_connector_min_instances
-  max_instances           = var.vpc_connector_max_instances
+# Cloud NAT: gives VMs with no external IP (e.g. the step-ca VM) outbound
+# internet access (apt/docker pulls) without exposing them publicly.
+resource "google_compute_router" "nat_router" {
+  name    = "${var.network_name}-nat-router"
+  network = google_compute_network.vpc.id
+  region  = var.region
+}
+
+resource "google_compute_router_nat" "nat" {
+  name                               = "${var.network_name}-nat"
+  router                             = google_compute_router.nat_router.name
+  region                             = var.region
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
 }

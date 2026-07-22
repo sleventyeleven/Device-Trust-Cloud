@@ -16,30 +16,6 @@ variable "subnet_name" {
   default     = "device-trust-subnet"
 }
 
-variable "vpc_connector_name" {
-  description = "Name of the VPC connector for Cloud Run"
-  type        = string
-  default     = "device-trust-connector"
-}
-
-variable "vpc_connector_min_instances" {
-  description = "Minimum number of instances for VPC connector"
-  type        = number
-  default     = 0
-}
-
-variable "vpc_connector_max_instances" {
-  description = "Maximum number of instances for VPC connector"
-  type        = number
-  default     = 10
-}
-
-variable "vpc_connector_machine_type" {
-  description = "Machine type for VPC connector"
-  type        = string
-  default     = "E2"
-}
-
 variable "region" {
   description = "Google Cloud region for Compute resources"
   type        = string

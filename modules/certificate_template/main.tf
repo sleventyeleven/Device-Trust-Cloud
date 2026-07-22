@@ -30,3 +30,9 @@ resource "google_privateca_certificate_template" "scep_template" {
     }
   }
 }
+
+resource "google_privateca_certificate_template_iam_binding" "template_user" {
+  certificate_template = google_privateca_certificate_template.scep_template.id
+  role                 = "roles/privateca.templateUser"
+  members              = var.certificate_template_iam_members
+}

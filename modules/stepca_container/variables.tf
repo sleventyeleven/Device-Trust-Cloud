@@ -10,8 +10,8 @@ variable "service_account_display_name" {
   default     = "Device Trust Service Accounts"
 }
 
-variable "stepca_service_name" {
-  description = "Name of the Cloud Run service for step-ca"
+variable "stepca_instance_name" {
+  description = "Base name for the step-ca VM and related resources"
   type        = string
   default     = "step-ca"
 }
@@ -28,58 +28,53 @@ variable "stepca_port" {
   default     = 9000
 }
 
-variable "stepca_fingerprint" {
-  description = "CA certificate fingerprint (SHA-256)"
-  type        = string
-  default     = ""
-}
-
 variable "stepca_domain" {
-  description = "Domain for step-ca (used for ACME, if applicable)"
+  description = "Domain for step-ca (used as the TLS SAN in ca.json), if applicable"
   type        = string
   default     = ""
 }
 
-variable "stepca_ca_config" {
-  description = "Additional CA configuration (as YAML string)"
+variable "ca_pool_name" {
+  description = "Short name of the CA pool containing the intermediate CA, used to sign the SCEP decrypter certificate"
   type        = string
-  default     = ""
 }
 
-variable "stepca_grace_period_days" {
-  description = "Grace period in days for certificate revocation"
-  type        = number
-  default     = 30
-}
-
-variable "min_instances" {
-  description = "Minimum number of instances for Cloud Run"
-  type        = number
-  default     = 0
-}
-
-variable "max_instances" {
-  description = "Maximum number of instances for Cloud Run"
-  type        = number
-  default     = 10
-}
-
-variable "managed_domain_enabled" {
-  description = "Enable Cloud Run domain mapping for step-ca"
-  type        = bool
-  default     = false
-}
-
-variable "vpc_connector_enabled" {
-  description = "Enable VPC connector for Cloud Run"
-  type        = bool
-  default     = true
-}
-
-variable "vpc_connector_name" {
-  description = "Name of the VPC connector for Cloud Run"
+variable "intermediate_ca_name" {
+  description = "Short certificate_authority_id of the intermediate CA, used to sign the SCEP decrypter certificate"
   type        = string
-  default     = "device-trust-connector"
+}
+
+variable "intermediate_ca_resource_id" {
+  description = "Full CAS resource path of the intermediate CA (projects/.../caPools/.../certificateAuthorities/...) that step-ca's cloudCAS RA delegates signing to"
+  type        = string
+}
+
+variable "ca_pool_iam_binding_ids" {
+  description = "IDs of the CA pool IAM bindings this module's service account needs; passed in (rather than a module-level depends_on) to avoid a dependency cycle, since the ca_pool module also depends on this module's service account email. Kept for parity even though nothing in this module currently waits on it directly."
+  type        = list(string)
+  default     = []
+}
+
+variable "machine_type" {
+  description = "Machine type for the step-ca VM"
+  type        = string
+  default     = "e2-small"
+}
+
+variable "zone" {
+  description = "Zone for the step-ca VM"
+  type        = string
+  default     = "us-central1-a"
+}
+
+variable "network_name" {
+  description = "Name of the VPC network the step-ca VM attaches to"
+  type        = string
+}
+
+variable "subnet_name" {
+  description = "Name of the subnet the step-ca VM attaches to"
+  type        = string
 }
 
 variable "project_id" {

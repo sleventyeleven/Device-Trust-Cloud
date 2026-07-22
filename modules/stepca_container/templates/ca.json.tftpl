@@ -1,0 +1,20 @@
+{
+  "address": ":${port}",
+  "dnsNames": ${dns_names_json},
+  "authority": {
+    "type": "cloudCAS",
+    "certificateAuthority": "${certificate_authority}",
+    "provisioners": [
+      {
+        "type": "SCEP",
+        "name": "device-trust-scep",
+        "forceCN": true,
+        "challenge": "${scep_challenge}",
+        "minimumPublicKeyLength": 2048,
+        "encryptionAlgorithmIdentifier": 2,
+        "decrypterCertificate": "${decrypter_cert_b64}",
+        "decrypterKeyPEM": "${decrypter_key_b64}"
+      }
+    ]
+  }
+}

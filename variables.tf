@@ -17,6 +17,19 @@ variable "region" {
   default     = "us-central1"
 }
 
+variable "gcp_apis_to_enable" {
+  description = "GCP APIs to enable on the project before creating any resources"
+  type        = list(string)
+  default = [
+    "compute.googleapis.com",
+    "privateca.googleapis.com",
+    "dns.googleapis.com",
+    "iam.googleapis.com",
+    "secretmanager.googleapis.com",
+    "storage.googleapis.com",
+  ]
+}
+
 # Network Configuration
 variable "network_name" {
   description = "Name of the VPC network"
@@ -34,30 +47,6 @@ variable "subnet_name" {
   description = "Name of the subnet"
   type        = string
   default     = "device-trust-subnet"
-}
-
-variable "vpc_connector_name" {
-  description = "Name of the VPC connector for Cloud Run"
-  type        = string
-  default     = "device-trust-connector"
-}
-
-variable "vpc_connector_min_instances" {
-  description = "Minimum number of instances for VPC connector"
-  type        = number
-  default     = 0
-}
-
-variable "vpc_connector_max_instances" {
-  description = "Maximum number of instances for VPC connector"
-  type        = number
-  default     = 10
-}
-
-variable "vpc_connector_machine_type" {
-  description = "Machine type for VPC connector"
-  type        = string
-  default     = "E2"
 }
 
 # CA Pool Configuration
@@ -155,8 +144,8 @@ variable "certificate_template_description" {
 }
 
 # Step-ca Configuration
-variable "stepca_service_name" {
-  description = "Name of the Cloud Run service for step-ca"
+variable "stepca_instance_name" {
+  description = "Base name for the step-ca VM and related resources"
   type        = string
   default     = "step-ca"
 }
@@ -173,131 +162,48 @@ variable "stepca_port" {
   default     = 9000
 }
 
-variable "stepca_fingerprint" {
-  description = "CA certificate fingerprint (SHA-256)"
-  type        = string
-  default     = ""
-}
-
 variable "stepca_domain" {
-  description = "Domain for step-ca (used for ACME, if applicable)"
+  description = "Domain for step-ca (used as the TLS SAN in ca.json), if applicable"
   type        = string
   default     = ""
-}
-
-variable "stepca_ca_config" {
-  description = "Additional CA configuration (as YAML string)"
-  type        = string
-  default     = ""
-}
-
-variable "stepca_grace_period_days" {
-  description = "Grace period in days for certificate revocation"
-  type        = number
-  default     = 30
-}
-
-variable "min_instances" {
-  description = "Minimum number of instances for Cloud Run"
-  type        = number
-  default     = 0
-}
-
-variable "max_instances" {
-  description = "Maximum number of instances for Cloud Run"
-  type        = number
-  default     = 10
-}
-
-variable "managed_domain_enabled" {
-  description = "Enable Cloud Run domain mapping for step-ca"
-  type        = bool
-  default     = false
-}
-
-variable "vpc_connector_enabled" {
-  description = "Enable VPC connector for Cloud Run"
-  type        = bool
-  default     = true
-}
-
-# SCEP Endpoint Configuration
-variable "scep_endpoint_name" {
-  description = "Name of the SCEP endpoint load balancer"
-  type        = string
-  default     = "scep-endpoint"
-}
-
-variable "scep_allowed_ips" {
-  description = "List of allowed IP ranges for SCEP access"
-  type        = list(string)
-  default     = []
-}
-
-variable "scep_iam_members" {
-  description = "List of IAM member roles for the SCEP endpoint instance"
-  type        = list(string)
-  default     = []
-}
-
-variable "scep_port" {
-  description = "Port for SCEP endpoint"
-  type        = number
-  default     = 80
 }
 
 variable "machine_type" {
-  description = "Machine type for the SCEP instance"
+  description = "Machine type for the step-ca VM"
   type        = string
-  default     = "e2-medium"
+  default     = "e2-small"
 }
 
 variable "zone" {
-  description = "Zone for the SCEP instance"
+  description = "Zone for the step-ca VM"
   type        = string
   default     = "us-central1-a"
 }
 
-variable "boot_disk_size" {
-  description = "Boot disk size in GB for the SCEP instance"
-  type        = number
-  default     = 20
-}
-
-variable "boot_disk_type" {
-  description = "Boot disk type for the SCEP instance"
+# SCEP Gateway Configuration (path-restricted LB in front of the step-ca VM)
+variable "scep_gateway_name" {
+  description = "Base name for the SCEP gateway load balancer resources"
   type        = string
-  default     = "pd-balanced"
+  default     = "scep-gateway"
 }
 
-variable "connection_draining_timeout" {
-  description = "Connection draining timeout in seconds for the SCEP backend service"
-  type        = number
-  default     = 300
+# mTLS Test Gateway Configuration (public nginx ClientAuth test target)
+variable "enable_mtls_test_gateway" {
+  description = "Whether to deploy the nginx mTLS test gateway (a small public VM used to verify enrolled device certs work for TLS ClientAuth). Disable to avoid the extra VM cost once testing is done."
+  type        = bool
+  default     = true
 }
 
-variable "backend_timeout_sec" {
-  description = "Backend service timeout in seconds for the SCEP backend service"
-  type        = number
-  default     = 300
+variable "mtls_gateway_name" {
+  description = "Base name for the mTLS test gateway VM and related resources"
+  type        = string
+  default     = "mtls-test-gateway"
 }
 
-variable "autoscale_max_instances" {
-  description = "Maximum number of autoscale instances for the SCEP instance group"
-  type        = number
-  default     = 10
-}
-
-variable "autoscale_min_instances" {
-  description = "Minimum number of autoscale instances for the SCEP instance group"
-  type        = number
-  default     = 1
-}
-
-variable "autoscale_cooldown_period" {
-  description = "Autoscale cooldown period in seconds for the SCEP instance group"
-  type        = number
-  default     = 60
+variable "mtls_gateway_machine_type" {
+  description = "Machine type for the mTLS test gateway VM"
+  type        = string
+  default     = "e2-small"
 }
 
 # Service Account Configuration
@@ -377,24 +283,25 @@ output "certificate_template_id" {
   value       = module.certificate_template.certificate_template_id
 }
 
-output "stepca_url" {
-  description = "URL for step-ca service"
-  value       = module.stepca.stepca_url
-}
-
 output "scep_endpoint_url" {
-  description = "URL for SCEP endpoint"
-  value       = module.scep_endpoint.scep_url
+  description = "URL for the SCEP enrollment endpoint (only /scep/* is publicly reachable through the gateway)"
+  value       = module.scep_gateway.scep_url
 }
 
-output "vpc_connector_self_link" {
-  description = "Self-link of the VPC connector"
-  value       = module.network.vpc_connector_self_link
+output "scep_gateway_ip" {
+  description = "Static public IP of the SCEP gateway load balancer"
+  value       = module.scep_gateway.scep_gateway_ip
 }
 
 output "service_account_email" {
   description = "Email address of the step-ca service account"
   value       = module.stepca.service_account_email
+  sensitive   = true
+}
+
+output "scep_challenge_password" {
+  description = "Shared secret SCEP clients must present to enroll (terraform output -raw scep_challenge_password)"
+  value       = module.stepca.scep_challenge_password
   sensitive   = true
 }
 
@@ -406,4 +313,9 @@ output "network_self_link" {
 output "subnet_self_link" {
   description = "Self-link of the subnet"
   value       = module.network.subnet_self_link
+}
+
+output "mtls_gateway_url" {
+  description = "URL of the nginx mTLS test gateway, used to verify enrolled device certs work for TLS ClientAuth (empty if enable_mtls_test_gateway is false)"
+  value       = var.enable_mtls_test_gateway ? module.mtls_test_gateway[0].mtls_gateway_url : ""
 }

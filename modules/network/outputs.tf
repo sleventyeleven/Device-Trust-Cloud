@@ -13,16 +13,6 @@ output "subnet_id" {
   value       = google_compute_subnetwork.subnet.id
 }
 
-output "vpc_connector_self_link" {
-  description = "Self-link of the VPC connector"
-  value       = google_vpc_access_connector.connector.self_link
-}
-
-output "vpc_connector_ip_range" {
-  description = "IP CIDR range used by the VPC connector"
-  value       = google_vpc_access_connector.connector.ip_cidr_range
-}
-
 output "network_name" {
   description = "Name of the network"
   value       = google_compute_network.vpc.name

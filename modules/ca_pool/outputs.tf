@@ -27,3 +27,11 @@ output "ca_pool_location" {
   description = "Location of the CA pool"
   value       = google_privateca_ca_pool.ca_pool.location
 }
+
+output "ca_pool_iam_binding_ids" {
+  description = "IDs of the IAM bindings granted on the CA pool, for callers that need to wait on their propagation without introducing a module dependency cycle"
+  value = [
+    google_privateca_ca_pool_iam_binding.ca_pool_issuer.id,
+    google_privateca_ca_pool_iam_binding.ca_pool_viewer.id,
+  ]
+}
