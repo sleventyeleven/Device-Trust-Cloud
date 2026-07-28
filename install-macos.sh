@@ -471,7 +471,18 @@ chown "$TARGET_USER" "$TMP_P12_DIR" "$P12_FILE"
 printf "${YELLOW}macOS will now ask for your password or Touch ID a third time, to import the device certificate itself...${NC}\n"
 sleep 2
 set +e
-sudo -u "$TARGET_USER" security import "$P12_FILE" -k "$LOGIN_KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/security -A
+# -T /usr/bin/security (not -A): grants only the security tool itself
+# access without a prompt, which is what the import operation needs -
+# -A additionally grants every application on the system access to the
+# private key without ever warning the user, which is broader than
+# necessary and is Apple's own documented definition of an insecure
+# access control setting. -x marks the private key non-exportable at the
+# keychain level, closing a real gap the prior command left open: without
+# it, the "non-exportable" claim made elsewhere in this script wasn't
+# actually enforced by the keychain itself, and the raw key could still be
+# exported (passphrase-free) via the Keychain Access GUI's own "Export"
+# menu item, regardless of any other access control settings.
+sudo -u "$TARGET_USER" security import "$P12_FILE" -k "$LOGIN_KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/security -x
 IMPORT_EXIT=$?
 set -e
 

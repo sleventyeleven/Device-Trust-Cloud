@@ -172,6 +172,16 @@ re-trigger those prompts for CAs that haven't changed. Run
 `security find-identity -v -p ssl-client` to confirm the device cert is
 there and usable.
 
+The import itself uses `security import ... -T /usr/bin/security -x` -
+`-T` grants only the `security` tool itself no-prompt access (needed for
+the import to complete), and `-x` marks the private key genuinely
+non-exportable at the keychain level. Earlier versions of this script also
+passed `-A` ("allow any application to access this item without warning"
+- Apple's own documented definition of an insecure access control setting)
+without `-x`, which meant the key could still be exported, passphrase-free,
+via Keychain Access's own "Export" menu item, regardless of any other
+setting. If you're on an older copy of this script, re-download it.
+
 On a renewal, any *previous* device certificate(s) are removed from the
 keychain (matched by common name, which is always the hostname): every
 matching certificate's SHA-256 hash is captured *before* the new one is
