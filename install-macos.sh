@@ -28,6 +28,17 @@ INTERMEDIATE_CA_FILE_SRC="${INTERMEDIATE_CA_FILE_SRC:-}"
 # installation using the just-issued cert, mirroring install-windows.ps1's
 # own PASS/FAIL test.
 MTLS_GATEWAY_URL="${MTLS_GATEWAY_URL:-}"
+# Optional: some SCEP front ends (e.g. AWS Private CA's Connector for SCEP)
+# hand back a complete, ready-to-use SCEP URL rather than a bare server with
+# a /scep/<provisioner> path step-ca expects appended to it. Set this to use
+# that URL verbatim for both enrollment and GetCACert, bypassing the
+# SCEP_SERVER_URL + SCEP_PROVISIONER path construction below entirely.
+SCEP_FULL_URL="${SCEP_FULL_URL:-}"
+# Content encryption algorithm for the SCEP PKIOperation request, passed to
+# our patched scepclient's -encryption-algo flag. DES-CBC (the upstream
+# default) works fine against step-ca/GCP; AWS Private CA's Connector for
+# SCEP requires AES-256-CBC (or AES-128-CBC) instead.
+SCEP_ENCRYPTION_ALGO="${SCEP_ENCRYPTION_ALGO:-DES-CBC}"
 
 # This script needs root (via sudo -E) to write to /usr/local/bin, but the
 # root/intermediate CA trust settings, the device certificate/key, and the
@@ -100,11 +111,16 @@ case "$(uname -m)" in
 esac
 
 echo "Configuration:"
-echo "- SCEP Server: $SCEP_SERVER_URL"
-echo "- Provisioner: $SCEP_PROVISIONER"
+if [ -n "$SCEP_FULL_URL" ]; then
+    echo "- SCEP Server: $SCEP_FULL_URL (SCEP_FULL_URL override, used as-is)"
+else
+    echo "- SCEP Server: $SCEP_SERVER_URL"
+    echo "- Provisioner: $SCEP_PROVISIONER"
+fi
 echo "- Hostname: $HOSTNAME"
 echo "- Architecture: $(uname -m) (using scepclient-darwin-${SCEP_ARCH})"
 echo "- Target user: $TARGET_USER"
+echo "- Encryption algo: $SCEP_ENCRYPTION_ALGO"
 echo "- Cert Directory: $CERT_DIR"
 echo ""
 
@@ -122,30 +138,22 @@ fetch_url() {
     fi
 }
 
-# Download scepclient for macOS. Releases ship as a versioned zip
-# (scepclient-darwin-<arch>-vX.Y.Z.zip) containing the scepclient-darwin-<arch>
-# binary, so the asset must be discovered via the GitHub API rather than a
-# fixed URL (no unversioned asset exists to link directly).
-echo "Downloading scepclient for macOS (${SCEP_ARCH})..."
+# Download scepclient for macOS from our fork of micromdm/scep
+# (sleventyeleven/scep), not the upstream release. Upstream's scepclient has
+# no way to choose the SCEP PKIOperation's content encryption algorithm and
+# always uses DES-CBC, which AWS Private CA's Connector for SCEP rejects
+# outright ("Unsupported algorithm: 1.3.14.3.2.7"). Our fork adds
+# -encryption-algo (DES-CBC/AES-128-CBC/AES-256-CBC, default DES-CBC - same
+# default as upstream, so this is a drop-in replacement for the GCP path).
+# Tracking upstream community PR https://github.com/micromdm/scep/pull/252,
+# which adds equivalent functionality - switch this back to the official
+# micromdm/scep release if/when that merges. See docs/aws-details.md.
+# Unlike upstream's versioned zips, our fork's release assets are bare
+# binaries, so no unzip step is needed.
+echo "Downloading scepclient for macOS (${SCEP_ARCH}, patched fork build)..."
 
-RELEASE_JSON=$(curl -sL "https://api.github.com/repos/micromdm/scep/releases/latest" 2>/dev/null || wget -qO- "https://api.github.com/repos/micromdm/scep/releases/latest")
-ASSET_URL=$(echo "$RELEASE_JSON" | grep -o "\"browser_download_url\": *\"[^\"]*scepclient-darwin-${SCEP_ARCH}-[^\"]*\.zip\"" | head -1 | grep -o 'https://[^"]*')
-
-if [ -z "$ASSET_URL" ]; then
-    printf "${RED}Error: could not find a scepclient-darwin-${SCEP_ARCH} release asset${NC}\n"
-    exit 1
-fi
-
-# A directory template, not "prefix.XXXXXX.zip" - macOS's BSD mktemp
-# doesn't reliably substitute the X's when followed by a literal suffix
-# (confirmed live elsewhere in this script - see the PKCS#12 packaging
-# section below), silently reusing the same fixed path across runs.
-TMP_DL_DIR=$(mktemp -d -t scepclient-dl.XXXXXX)
-TMP_ZIP="${TMP_DL_DIR}/scepclient.zip"
-fetch_url "$ASSET_URL" "$TMP_ZIP"
-unzip -o -q "$TMP_ZIP" -d "$INSTALL_DIR"
-mv "$INSTALL_DIR/scepclient-darwin-${SCEP_ARCH}" "$INSTALL_DIR/scepclient"
-rm -rf "$TMP_DL_DIR"
+ASSET_URL="https://github.com/sleventyeleven/scep/releases/download/v2.3.0-encryption-algo-test1/scepclient-darwin-${SCEP_ARCH}"
+fetch_url "$ASSET_URL" "$INSTALL_DIR/scepclient"
 chmod +x "$INSTALL_DIR/scepclient"
 
 printf "${GREEN}scepclient downloaded successfully${NC}\n"
@@ -207,7 +215,11 @@ elif [ -n "$INTERMEDIATE_CA_URL" ]; then
     fetch_url "$INTERMEDIATE_CA_URL" "$INTERMEDIATE_CA_FILE"
 else
     echo "No INTERMEDIATE_CA_FILE_SRC/INTERMEDIATE_CA_URL set - deriving the intermediate CA automatically from the SCEP server's GetCACert response..."
-    GETCACERT_URL="${SCEP_SERVER_URL}/scep/${SCEP_PROVISIONER}?operation=GetCACert"
+    if [ -n "$SCEP_FULL_URL" ]; then
+        GETCACERT_URL="${SCEP_FULL_URL}?operation=GetCACert"
+    else
+        GETCACERT_URL="${SCEP_SERVER_URL}/scep/${SCEP_PROVISIONER}?operation=GetCACert"
+    fi
     TMP_CACERT_SPLIT_DIR=$(mktemp -d -t getcacert.XXXXXX)
     TMP_CACERT_DER="${TMP_CACERT_SPLIT_DIR}/getcacert.der"
     TMP_CACERT_BUNDLE="${TMP_CACERT_SPLIT_DIR}/getcacert-bundle.pem"
@@ -310,12 +322,16 @@ echo ""
 
 # Build scepclient command
 SCEPTOOL="$INSTALL_DIR/scepclient"
-SERVER_URL="${SCEP_SERVER_URL}/scep/${SCEP_PROVISIONER}"
+if [ -n "$SCEP_FULL_URL" ]; then
+    SERVER_URL="$SCEP_FULL_URL"
+else
+    SERVER_URL="${SCEP_SERVER_URL}/scep/${SCEP_PROVISIONER}"
+fi
 DNS_NAME="$HOSTNAME"
 COMMON_NAME="$HOSTNAME"
 
 echo "Command:"
-echo "$SCEPTOOL" -private-key "$PRIVATE_KEY_FILE" -certificate "$CERT_FILE" -server-url "$SERVER_URL" -challenge "$SCEP_CHALLENGE" -dnsname "$DNS_NAME" -cn "$COMMON_NAME" -country "$CERT_COUNTRY" -organization "$CERT_ORGANIZATION" -ou "$CERT_OU"
+echo "$SCEPTOOL" -private-key "$PRIVATE_KEY_FILE" -certificate "$CERT_FILE" -server-url "$SERVER_URL" -challenge "$SCEP_CHALLENGE" -dnsnames "$DNS_NAME" -cn "$COMMON_NAME" -country "$CERT_COUNTRY" -organization "$CERT_ORGANIZATION" -ou "$CERT_OU" -encryption-algo "$SCEP_ENCRYPTION_ALGO"
 
 echo ""
 
@@ -336,8 +352,23 @@ fi
 # $CERT_DIR is owned by $TARGET_USER (see above) specifically so this can
 # write client.key/client.crt there without needing root for every run.
 set +e
-sudo -u "$TARGET_USER" "$SCEPTOOL" -private-key "$PRIVATE_KEY_FILE" -certificate "$CERT_FILE" -server-url "$SERVER_URL" -challenge "$SCEP_CHALLENGE" -dnsname "$DNS_NAME" -cn "$COMMON_NAME" -country "$CERT_COUNTRY" -organization "$CERT_ORGANIZATION" -ou "$CERT_OU"
+sudo -u "$TARGET_USER" "$SCEPTOOL" -private-key "$PRIVATE_KEY_FILE" -certificate "$CERT_FILE" -server-url "$SERVER_URL" -challenge "$SCEP_CHALLENGE" -dnsnames "$DNS_NAME" -cn "$COMMON_NAME" -country "$CERT_COUNTRY" -organization "$CERT_ORGANIZATION" -ou "$CERT_OU" -encryption-algo "$SCEP_ENCRYPTION_ALGO"
 SCEP_EXIT=$?
+
+# AWS Private CA's Connector for SCEP reliably fails the *first*
+# PKIOperation of any fresh request with a misleading "certificate expired"
+# error, then succeeds on an identical retry a few seconds later (confirmed
+# repeatedly against a real deployment - see docs/aws-details.md). Retrying
+# once here, reusing the same cached csr.pem/self.pem/key rather than
+# regenerating them, works around it. Harmless against step-ca/GCP too,
+# since a real failure there just fails the same way twice.
+if [ $SCEP_EXIT -ne 0 ]; then
+    echo ""
+    printf "${YELLOW}First enrollment attempt failed - retrying once in 15 seconds (AWS Connector for SCEP is known to reject the first attempt of a fresh request; a retry usually succeeds)...${NC}\n"
+    sleep 15
+    sudo -u "$TARGET_USER" "$SCEPTOOL" -private-key "$PRIVATE_KEY_FILE" -certificate "$CERT_FILE" -server-url "$SERVER_URL" -challenge "$SCEP_CHALLENGE" -dnsnames "$DNS_NAME" -cn "$COMMON_NAME" -country "$CERT_COUNTRY" -organization "$CERT_ORGANIZATION" -ou "$CERT_OU" -encryption-algo "$SCEP_ENCRYPTION_ALGO"
+    SCEP_EXIT=$?
+fi
 set -e
 
 if [ $SCEP_EXIT -ne 0 ]; then

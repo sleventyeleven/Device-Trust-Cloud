@@ -1,0 +1,32 @@
+#!/bin/bash
+set -e
+
+dnf install -y docker
+systemctl enable --now docker
+
+mkdir -p /etc/nginx-test/certs /etc/nginx-test/conf.d
+
+cat > /etc/nginx-test/certs/ca-bundle.crt <<'CABUNDLE'
+${ca_bundle}
+CABUNDLE
+
+cat > /etc/nginx-test/certs/server.crt <<'SERVERCERT'
+${server_cert}
+SERVERCERT
+
+cat > /etc/nginx-test/conf.d/mtls.conf <<'NGINXCONF'
+${nginx_conf}
+NGINXCONF
+
+aws secretsmanager get-secret-value \
+  --secret-id ${server_key_secret_id} \
+  --region ${region} \
+  --query SecretString \
+  --output text > /etc/nginx-test/certs/server.key
+chmod 600 /etc/nginx-test/certs/server.key
+
+docker run -d --name mtls-test --restart unless-stopped \
+  -p 443:443 \
+  -v /etc/nginx-test/certs:/etc/nginx/certs:ro \
+  -v /etc/nginx-test/conf.d:/etc/nginx/conf.d:ro \
+  nginx:latest

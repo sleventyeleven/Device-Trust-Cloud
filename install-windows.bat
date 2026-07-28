@@ -15,6 +15,10 @@ set CERT_FRIENDLY_NAME=Device Trust Certificate
 REM KEY_PROTECTION: Delete (default) or RestrictPermissions - see Readme.md
 if not defined KEY_PROTECTION set KEY_PROTECTION=Delete
 
+REM ENCRYPTION_ALGO: DES-CBC (default, matches step-ca/GCP), AES-128-CBC, or
+REM AES-256-CBC. AWS Private CA's Connector for SCEP requires an AES variant.
+if not defined ENCRYPTION_ALGO set ENCRYPTION_ALGO=DES-CBC
+
 REM Renewal state is tracked via the certificate store (by FriendlyName)
 REM rather than loose files, since KeyProtection=Delete removes the loose
 REM files but the store entry persists.
@@ -50,6 +54,12 @@ set CERT_COUNTRY=%CERT_COUNTRY%
 set CERT_ORGANIZATION=%CERT_ORGANIZATION%
 set CERT_OU=%CERT_OU%
 set MTLS_GATEWAY_URL=%MTLS_GATEWAY_URL%
+REM Some SCEP front ends (e.g. AWS Private CA's Connector for SCEP) hand
+REM back a complete, ready-to-use SCEP URL rather than a bare server with a
+REM /scep/<provisioner> path step-ca expects appended to it. Set this to use
+REM that URL verbatim, bypassing the SCEP_SERVER_URL + SCEP_PROVISIONER path
+REM construction below entirely.
+set SCEP_FULL_URL=%SCEP_FULL_URL%
 
 REM Certificate file paths (INSTALL_DIR/CERT_DIR are set earlier, before the
 REM renewal check)
@@ -82,19 +92,32 @@ if not exist "%CERT_DIR%" (
 )
 
 echo Configuration:
-echo - SCEP Server: %SCEP_SERVER_URL%
-echo - Provisioner: %SCEP_PROVISIONER%
+if defined SCEP_FULL_URL (
+    echo - SCEP Server: %SCEP_FULL_URL% ^(SCEP_FULL_URL override, used as-is^)
+) else (
+    echo - SCEP Server: %SCEP_SERVER_URL%
+    echo - Provisioner: %SCEP_PROVISIONER%
+)
 echo - Hostname: %HOSTNAME%
 echo - Key protection: %KEY_PROTECTION%
+echo - Encryption algo: %ENCRYPTION_ALGO%
 echo - Cert Directory: %CERT_DIR%
 echo.
 
-REM Download scepclient for Windows. Releases ship as a versioned zip
-REM (scepclient-windows-amd64-vX.Y.Z.zip) containing scepclient-windows-amd64.exe,
-REM so the asset must be discovered via the GitHub API rather than a fixed URL.
-echo Downloading scepclient for Windows...
+REM Download scepclient for Windows from our fork of micromdm/scep
+REM (sleventyeleven/scep), not the upstream release. Upstream's scepclient
+REM has no way to choose the SCEP PKIOperation's content encryption
+REM algorithm and always uses DES-CBC, which AWS Private CA's Connector for
+REM SCEP rejects outright ("Unsupported algorithm: 1.3.14.3.2.7"). Our fork
+REM adds -encryption-algo (DES-CBC/AES-128-CBC/AES-256-CBC, default
+REM DES-CBC - same default as upstream, so this is a drop-in replacement for
+REM the GCP path). Tracking upstream community PR
+REM https://github.com/micromdm/scep/pull/252, which adds equivalent
+REM functionality - switch this back to the official micromdm/scep release
+REM if/when that merges. See docs/aws-details.md.
+echo Downloading scepclient for Windows (patched fork build)...
 
-powershell -Command "$ProgressPreference = 'SilentlyContinue'; try { $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/micromdm/scep/releases/latest' -UseBasicParsing; $asset = $release.assets | Where-Object { $_.name -like 'scepclient-windows-amd64-*.zip' } | Select-Object -First 1; if (-not $asset) { throw 'No scepclient-windows-amd64 asset found' }; Invoke-WebRequest -Uri $asset.browser_download_url -OutFile '%INSTALL_DIR%\scepclient.zip' -UseBasicParsing; Expand-Archive -Path '%INSTALL_DIR%\scepclient.zip' -DestinationPath '%INSTALL_DIR%' -Force; Move-Item -Path '%INSTALL_DIR%\scepclient-windows-amd64.exe' -Destination '%INSTALL_DIR%\scepclient.exe' -Force; Remove-Item -Path '%INSTALL_DIR%\scepclient.zip' -Force; Write-Host 'Downloaded successfully' } catch { Write-Host ('Download failed: ' + $_.Exception.Message); exit 1 }"
+powershell -Command "$ProgressPreference = 'SilentlyContinue'; try { Invoke-WebRequest -Uri 'https://github.com/sleventyeleven/scep/releases/download/v2.3.0-encryption-algo-test1/scepclient-windows-amd64.exe' -OutFile '%INSTALL_DIR%\scepclient.exe' -UseBasicParsing; Write-Host 'Downloaded successfully' } catch { Write-Host ('Download failed: ' + $_.Exception.Message); exit 1 }"
 
 if %errorLevel% neq 0 (
     echo Error: Failed to download scepclient
@@ -178,12 +201,16 @@ echo.
 REM Build scepclient command
 set SCEPTOOL=%INSTALL_DIR%\scepclient.exe
 set STEPTOOL=%INSTALL_DIR%\step.exe
-set SERVER_URL=%SCEP_SERVER_URL%/scep/%SCEP_PROVISIONER%
+if defined SCEP_FULL_URL (
+    set SERVER_URL=%SCEP_FULL_URL%
+) else (
+    set SERVER_URL=%SCEP_SERVER_URL%/scep/%SCEP_PROVISIONER%
+)
 set DNS_NAME=%HOSTNAME%
 set COMMON_NAME=%HOSTNAME%
 
 echo Command:
-echo "%SCEPTOOL%" -private-key "%PRIVATE_KEY_FILE%" -certificate "%CERT_FILE%" -server-url "%SERVER_URL%" -challenge "%SCEP_CHALLENGE%" -dnsname "%DNS_NAME%" -cn "%COMMON_NAME%" -country "%CERT_COUNTRY%" -organization "%CERT_ORGANIZATION%" -ou "%CERT_OU%"
+echo "%SCEPTOOL%" -private-key "%PRIVATE_KEY_FILE%" -certificate "%CERT_FILE%" -server-url "%SERVER_URL%" -challenge "%SCEP_CHALLENGE%" -dnsnames "%DNS_NAME%" -cn "%COMMON_NAME%" -country "%CERT_COUNTRY%" -organization "%CERT_ORGANIZATION%" -ou "%CERT_OU%" -encryption-algo "%ENCRYPTION_ALGO%"
 
 REM If there's no private key for scepclient to reuse, it's about to
 REM generate a brand-new one - clear any cached csr.pem left over from a
@@ -194,7 +221,22 @@ if not exist "%PRIVATE_KEY_FILE%" if exist "%CSR_CACHE_FILE%" del "%CSR_CACHE_FI
 REM No file-based backup/restore needed here - the old certificate store
 REM entry, if any, isn't touched until the new one has been imported
 REM successfully further down.
-"%SCEPTOOL%" -private-key "%PRIVATE_KEY_FILE%" -certificate "%CERT_FILE%" -server-url "%SERVER_URL%" -challenge "%SCEP_CHALLENGE%" -dnsname "%DNS_NAME%" -cn "%COMMON_NAME%" -country "%CERT_COUNTRY%" -organization "%CERT_ORGANIZATION%" -ou "%CERT_OU%"
+"%SCEPTOOL%" -private-key "%PRIVATE_KEY_FILE%" -certificate "%CERT_FILE%" -server-url "%SERVER_URL%" -challenge "%SCEP_CHALLENGE%" -dnsnames "%DNS_NAME%" -cn "%COMMON_NAME%" -country "%CERT_COUNTRY%" -organization "%CERT_ORGANIZATION%" -ou "%CERT_OU%" -encryption-algo "%ENCRYPTION_ALGO%"
+
+REM AWS Private CA's Connector for SCEP reliably fails the *first*
+REM PKIOperation of any fresh request with a misleading "certificate
+REM expired" error, then succeeds on an identical retry a few seconds later
+REM (confirmed repeatedly against a real deployment - see
+REM docs/aws-details.md). Retrying once here, reusing the same cached
+REM csr.pem/self.pem/key rather than regenerating them, works around it.
+REM Harmless against step-ca/GCP too, since a real failure there just fails
+REM the same way twice.
+if %errorLevel% neq 0 (
+    echo.
+    echo First enrollment attempt failed - retrying once in 15 seconds ^(AWS Connector for SCEP is known to reject the first attempt of a fresh request; a retry usually succeeds^)...
+    timeout /t 15 /nobreak >nul
+    "%SCEPTOOL%" -private-key "%PRIVATE_KEY_FILE%" -certificate "%CERT_FILE%" -server-url "%SERVER_URL%" -challenge "%SCEP_CHALLENGE%" -dnsnames "%DNS_NAME%" -cn "%COMMON_NAME%" -country "%CERT_COUNTRY%" -organization "%CERT_ORGANIZATION%" -ou "%CERT_OU%" -encryption-algo "%ENCRYPTION_ALGO%"
+)
 
 if %errorLevel% neq 0 (
     echo.

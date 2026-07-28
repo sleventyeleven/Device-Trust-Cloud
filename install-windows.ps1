@@ -13,9 +13,15 @@ param(
     [string]$RootCaFile = $env:ROOT_CA_FILE,
     [string]$IntermediateCaUrl = $env:INTERMEDIATE_CA_URL,
     [string]$IntermediateCaFile = $env:INTERMEDIATE_CA_FILE_SRC,
-    [string]$Country = $env:CERT_COUNTRY,
-    [string]$Organization = $env:CERT_ORGANIZATION,
-    [string]$Ou = $env:CERT_OU,
+    # Defaulted, not left empty: PowerShell silently drops empty-string
+    # arguments when calling a native executable, shifting every argument
+    # after it over by one position - the same quirk already documented
+    # for the PFX password below. If these were ever empty, that shift
+    # can eat -encryption-algo's own value, silently falling back to
+    # DES-CBC without any visible error.
+    [string]$Country = $(if ($env:CERT_COUNTRY) { $env:CERT_COUNTRY } else { "US" }),
+    [string]$Organization = $(if ($env:CERT_ORGANIZATION) { $env:CERT_ORGANIZATION } else { "DeviceTrust" }),
+    [string]$Ou = $(if ($env:CERT_OU) { $env:CERT_OU } else { "DeviceTrust" }),
     # Delete: remove the loose private key after import (default - matches
     #   "non-exportable" most literally, but forces a full re-enrollment
     #   (new key, new cert, new CA-signing operation) on every renewal.
@@ -24,7 +30,19 @@ param(
     #   security/cost trade-off between these.
     [ValidateSet("Delete", "RestrictPermissions")]
     [string]$KeyProtection = $(if ($env:KEY_PROTECTION) { $env:KEY_PROTECTION } else { "Delete" }),
-    [string]$MtlsGatewayUrl = $env:MTLS_GATEWAY_URL
+    [string]$MtlsGatewayUrl = $env:MTLS_GATEWAY_URL,
+    # Some SCEP front ends (e.g. AWS Private CA's Connector for SCEP) hand
+    # back a complete, ready-to-use SCEP URL rather than a bare server with
+    # a /scep/<provisioner> path step-ca expects appended to it. Set this to
+    # use that URL verbatim for both enrollment and GetCACert, bypassing the
+    # ScepServerUrl + Provisioner path construction entirely.
+    [string]$ScepFullUrl = $env:SCEP_FULL_URL,
+    # Content encryption algorithm for the SCEP PKIOperation request, passed
+    # to our patched scepclient's -encryption-algo flag. DES-CBC (the
+    # upstream default) works fine against step-ca/GCP; AWS Private CA's
+    # Connector for SCEP requires AES-256-CBC (or AES-128-CBC) instead.
+    [ValidateSet("DES-CBC", "AES-128-CBC", "AES-256-CBC")]
+    [string]$EncryptionAlgo = $(if ($env:ENCRYPTION_ALGO) { $env:ENCRYPTION_ALGO } else { "DES-CBC" })
 )
 
 # Check for Administrator privileges
@@ -89,31 +107,34 @@ if ($IsRenewal) {
 }
 Write-Host ""
 Write-Host "Configuration:"
-Write-Host "- SCEP Server: $ScepServerUrl"
-Write-Host "- Provisioner: $Provisioner"
+if ($ScepFullUrl) {
+    Write-Host "- SCEP Server: $ScepFullUrl (ScepFullUrl override, used as-is)"
+} else {
+    Write-Host "- SCEP Server: $ScepServerUrl"
+    Write-Host "- Provisioner: $Provisioner"
+}
 Write-Host "- Hostname: $Hostname"
 Write-Host "- Key protection: $KeyProtection"
+Write-Host "- Encryption algo: $EncryptionAlgo"
 Write-Host "- Cert Directory: $CertDir"
 Write-Host ""
 
-# Download scepclient for Windows. Releases ship as a versioned zip
-# (scepclient-windows-amd64-vX.Y.Z.zip) containing scepclient-windows-amd64.exe,
-# so the asset must be discovered via the GitHub API rather than a fixed URL.
-Write-Host "Downloading scepclient for Windows..." -ForegroundColor Yellow
+# Download scepclient for Windows from our fork of micromdm/scep
+# (sleventyeleven/scep), not the upstream release. Upstream's scepclient has
+# no way to choose the SCEP PKIOperation's content encryption algorithm and
+# always uses DES-CBC, which AWS Private CA's Connector for SCEP rejects
+# outright ("Unsupported algorithm: 1.3.14.3.2.7"). Our fork adds
+# -encryption-algo (DES-CBC/AES-128-CBC/AES-256-CBC, default DES-CBC - same
+# default as upstream, so this is a drop-in replacement for the GCP path).
+# Tracking upstream community PR https://github.com/micromdm/scep/pull/252,
+# which adds equivalent functionality - switch this back to the official
+# micromdm/scep release if/when that merges. See docs/aws-details.md.
+Write-Host "Downloading scepclient for Windows (patched fork build)..." -ForegroundColor Yellow
 
 try {
     $ProgressPreference = 'SilentlyContinue'
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/micromdm/scep/releases/latest" -UseBasicParsing
-    $asset = $release.assets | Where-Object { $_.name -like "scepclient-windows-amd64-*.zip" } | Select-Object -First 1
-    if (-not $asset) {
-        throw "No scepclient-windows-amd64 asset found in the latest micromdm/scep release"
-    }
-
-    $zipPath = "$InstallDir\scepclient.zip"
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -UseBasicParsing
-    Expand-Archive -Path $zipPath -DestinationPath $InstallDir -Force
-    Move-Item -Path "$InstallDir\scepclient-windows-amd64.exe" -Destination "$InstallDir\scepclient.exe" -Force
-    Remove-Item -Path $zipPath -Force
+    $scepClientUrl = "https://github.com/sleventyeleven/scep/releases/download/v2.3.0-encryption-algo-test1/scepclient-windows-amd64.exe"
+    Invoke-WebRequest -Uri $scepClientUrl -OutFile "$InstallDir\scepclient.exe" -UseBasicParsing
     Write-Host "Downloaded scepclient successfully" -ForegroundColor Green
 } catch {
     Write-Error "Failed to download scepclient: $($_.Exception.Message)"
@@ -230,7 +251,11 @@ if ($IntermediateCaFile -and (Test-Path -Path $IntermediateCaFile)) {
     [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $trustAllDelegate
     try {
         $ProgressPreference = 'SilentlyContinue'
-        $getCaCertUrl = "$ScepServerUrl/scep/$Provisioner`?operation=GetCACert"
+        if ($ScepFullUrl) {
+            $getCaCertUrl = "$ScepFullUrl`?operation=GetCACert"
+        } else {
+            $getCaCertUrl = "$ScepServerUrl/scep/$Provisioner`?operation=GetCACert"
+        }
         $caCertResponse = Invoke-WebRequest -Uri $getCaCertUrl -UseBasicParsing
         Add-Type -AssemblyName System.Security
         $signedCms = New-Object System.Security.Cryptography.Pkcs.SignedCms
@@ -262,12 +287,16 @@ Write-Host ""
 
 # Build scepclient command
 $ScepTool = "$InstallDir\scepclient.exe"
-$ServerUrl = "$ScepServerUrl/scep/$Provisioner"
+if ($ScepFullUrl) {
+    $ServerUrl = $ScepFullUrl
+} else {
+    $ServerUrl = "$ScepServerUrl/scep/$Provisioner"
+}
 $DnsName = $Hostname
 $CommonName = $Hostname
 
 Write-Host "Command:" -ForegroundColor Cyan
-Write-Host "$ScepTool -private-key `"$PrivateKeyFile`" -certificate `"$CertFile`" -server-url `"$ServerUrl`" -challenge `"$Challenge`" -dnsname `"$DnsName`" -cn `"$CommonName`" -country `"$Country`" -organization `"$Organization`" -ou `"$Ou`"" -NoNewline
+Write-Host "$ScepTool -private-key `"$PrivateKeyFile`" -certificate `"$CertFile`" -server-url `"$ServerUrl`" -challenge `"$Challenge`" -dnsnames `"$DnsName`" -cn `"$CommonName`" -country `"$Country`" -organization `"$Organization`" -ou `"$Ou`" -encryption-algo `"$EncryptionAlgo`"" -NoNewline
 Write-Host ""
 
 # If there's no private key for scepclient to reuse, it's about to generate
@@ -282,7 +311,21 @@ if (-not (Test-Path -Path $PrivateKeyFile) -and (Test-Path -Path $CsrCacheFile))
 # Execute scepclient. (No file-based backup/restore needed here anymore - the
 # old certificate store entry, if any, isn't touched until the new one has
 # been imported successfully further down.)
-& $ScepTool -private-key $PrivateKeyFile -certificate $CertFile -server-url $ServerUrl -challenge $Challenge -dnsname $DnsName -cn $CommonName -country $Country -organization $Organization -ou $Ou
+& $ScepTool -private-key $PrivateKeyFile -certificate $CertFile -server-url $ServerUrl -challenge $Challenge -dnsnames $DnsName -cn $CommonName -country $Country -organization $Organization -ou $Ou -encryption-algo $EncryptionAlgo
+
+# AWS Private CA's Connector for SCEP reliably fails the *first* PKIOperation
+# of any fresh request with a misleading "certificate expired" error, then
+# succeeds on an identical retry a few seconds later (confirmed repeatedly
+# against a real deployment - see docs/aws-details.md). Retrying once here,
+# reusing the same cached csr.pem/self.pem/key rather than regenerating them,
+# works around it. Harmless against step-ca/GCP too, since a real failure
+# there just fails the same way twice.
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "First enrollment attempt failed - retrying once in 15 seconds (AWS Connector for SCEP is known to reject the first attempt of a fresh request; a retry usually succeeds)..." -ForegroundColor Yellow
+    Start-Sleep -Seconds 15
+    & $ScepTool -private-key $PrivateKeyFile -certificate $CertFile -server-url $ServerUrl -challenge $Challenge -dnsnames $DnsName -cn $CommonName -country $Country -organization $Organization -ou $Ou -encryption-algo $EncryptionAlgo
+}
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""

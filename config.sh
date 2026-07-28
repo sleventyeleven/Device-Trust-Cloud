@@ -14,11 +14,23 @@
 # SCEP_PROVISIONER matches the provisioner name in
 # modules/stepca_container/templates/ca.json.tftpl ("device-trust-scep");
 # only change it if that template changes too.
+#   SCEP_FULL_URL (optional): set instead of SCEP_SERVER_URL/SCEP_PROVISIONER
+#     when the SCEP front end already hands back a complete URL rather than
+#     a bare server + /scep/<provisioner> path - e.g. AWS Private CA's
+#     Connector for SCEP (aws/modules/connector_scep). Used verbatim for
+#     both enrollment and GetCACert when set.
+#   SCEP_ENCRYPTION_ALGO (optional): DES-CBC (default, matches step-ca/GCP),
+#     AES-128-CBC, or AES-256-CBC. AWS Private CA's Connector for SCEP
+#     requires an AES variant - see docs/aws-details.md for why the install
+#     scripts fetch scepclient from a patched fork rather than upstream to
+#     support this.
 
 # SCEP Server Configuration
 SCEP_SERVER_URL="${SCEP_SERVER_URL:-}"
 SCEP_PROVISIONER="${SCEP_PROVISIONER:-device-trust-scep}"
 SCEP_CHALLENGE="${SCEP_CHALLENGE:-}"
+SCEP_FULL_URL="${SCEP_FULL_URL:-}"
+SCEP_ENCRYPTION_ALGO="${SCEP_ENCRYPTION_ALGO:-DES-CBC}"
 INTERMEDIATE_CA_FILE_SRC="${INTERMEDIATE_CA_FILE_SRC:-}"
 
 # Certificate Subject Configuration
