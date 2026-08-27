@@ -82,10 +82,6 @@ Thumbs.db
 !.env.example
 !.gitignore
 
-# Documentation
-docs/
-*.md
-
 # Deployment
 deployment/
 deploy/
