@@ -1,14 +1,18 @@
 # AWS: Architecture, Deployment, and Enrollment
 
-Status: **deployed and enrollment-verified end to end against a real AWS
-account.** `terraform apply` succeeds, the CA hierarchy issues valid
-certificates, the Connector for SCEP endpoint serves `GetCACert`
-correctly, a real device enrolls successfully through the install scripts,
-and the issued certificate works for TLS ClientAuth against the mTLS test
-gateway. Getting real enrollment working required two fixes to
-`scepclient` (a rejected legacy encryption algorithm, and a transient
-AWS-side quirk on first request) - both are implemented in the install
-scripts and documented in "SCEP Client Compatibility" below.
+Status: **beta / testing release.** Deployed and enrollment-verified end
+to end against a real AWS account - `terraform apply` succeeds, the CA
+hierarchy issues valid certificates, the Connector for SCEP endpoint
+serves `GetCACert` correctly, a real device enrolls successfully through
+the install scripts, and the issued certificate works for TLS ClientAuth
+against the mTLS test gateway. That said, this hasn't had the same
+real-world mileage as the GCP side yet, and there's one deliberate,
+currently-unresolved dependency worth understanding before treating this
+as production-ready: getting enrollment working required two fixes to
+`scepclient`, and one of them (a rejected legacy encryption algorithm)
+is currently only available via a **self-maintained fork**, not an
+official release. See "SCEP Client Compatibility" below for exactly what
+that means, why it exists, and what would remove it.
 
 This replaces the earlier pure design-notes version of this document now
 that the two options described there have actually been decided between:
@@ -250,12 +254,17 @@ same limitation hit during GCP testing. `openssl s_client` (bundled with
 Git for Windows) works directly against PEM files and was used for the
 mTLS verification above instead.
 
-## SCEP Client Compatibility (Resolved)
+## SCEP Client Compatibility (Working, via a Soft Blocker)
 
 `install-macos.sh`/`install-windows.ps1`/`install-windows.bat` use
 `micromdm/scep`'s `scepclient` to actually speak the SCEP protocol.
 Upstream `scepclient` failed to enroll against AWS's Connector for SCEP
-outright - two separate issues, both now understood and fixed.
+outright - two separate issues, both now understood and worked around.
+**Enrollment genuinely works today**, but Issue 1's fix depends on
+infrastructure (a fork we maintain ourselves) that this project didn't
+previously need to maintain, which is the main reason the AWS path is
+labeled beta rather than production-ready. Read on for exactly what that
+dependency is and what would remove it.
 
 ### Issue 1: DES-CBC is rejected
 

@@ -62,16 +62,23 @@ known limitations, and troubleshooting for this implementation live in
 AWS support also exists (`aws/`, a separate Terraform root with its own
 state): AWS Private CA for the root and intermediate CA, and AWS Private
 CA's fully managed Connector for SCEP as the SCEP front end - no step-ca VM
-required on this side. The infrastructure has been deployed and
-enrollment-verified end to end against a real AWS account: the CA
+required on this side. **This is a beta / testing release, not yet as
+battle-tested as the GCP side** - the infrastructure has been deployed and
+enrollment-verified end to end against a real AWS account (the CA
 hierarchy issues valid certificates, the SCEP connector serves `GetCACert`
 correctly, a real device enrolls successfully through the install scripts,
 and the issued certificate works for TLS ClientAuth against the mTLS test
-gateway. Getting enrollment working required patching around two issues in
-the `micromdm/scep` client the install scripts use - see
+gateway), but expect to still find rough edges, and treat it as something
+to pilot deliberately rather than adopt outright. In particular, there is
+a current soft blocker worth knowing about before relying on this: the
+install scripts fetch `scepclient` from a **patched, self-maintained fork**
+rather than the official `micromdm/scep` release, because upstream's
+client hardcodes an encryption algorithm AWS's Connector for SCEP rejects
+outright - see "SCEP Client Compatibility" below for exactly what that
+means and its current status. See
 [docs/aws-details.md](docs/aws-details.md) for the full deployment guide,
-what differs from the GCP design, and the "SCEP Client Compatibility"
-section for what those issues were and how they're handled.
+what differs from the GCP design, and further detail on what's still in
+flux.
 
 ## Features
 
