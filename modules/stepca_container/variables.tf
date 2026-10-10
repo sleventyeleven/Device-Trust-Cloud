@@ -88,3 +88,39 @@ variable "location" {
   type        = string
   default     = "us-central1"
 }
+
+variable "enable_webhook" {
+  description = "Run the device-trust-webhook next to step-ca and attach it to the SCEP provisioners"
+  type        = bool
+  default     = false
+}
+
+variable "webhook_binary_path" {
+  description = "Local path of the linux/amd64 device-trust-webhook binary to upload"
+  type        = string
+  default     = ""
+}
+
+variable "webhook_enroll_provisioner" {
+  description = "SCEP provisioner name for enrollment"
+  type        = string
+  default     = "device-trust-scep"
+}
+
+variable "webhook_renew_provisioner" {
+  description = "SCEP provisioner name for renewal"
+  type        = string
+  default     = "device-trust-scep-renew"
+}
+
+variable "scep_cert_lifetime" {
+  description = "Lifetime of issued device certificates as a Go duration (for example 1080h). Empty keeps step-ca's default of 24 hours"
+  type        = string
+  default     = ""
+}
+
+variable "webhook_devices" {
+  description = "Allowlist lines of HOSTNAME,SERIAL[,note]"
+  type        = string
+  default     = ""
+}

@@ -250,6 +250,64 @@ variable "acme_validation_ttl" {
   default     = 300
 }
 
+# Per-device SCEP challenge webhook (see webhook/README.md). Off by default:
+# the existing single static SCEP challenge keeps working unless this is enabled.
+variable "enable_webhook" {
+  description = "Run the device-trust-webhook next to step-ca and attach it to the SCEP provisioners. Replaces the static SCEP challenge"
+  type        = bool
+  default     = false
+}
+
+variable "webhook_binary_path" {
+  description = "Local path of the linux/amd64 device-trust-webhook binary to upload (build it with: cd webhook && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o device-trust-webhook .). Required when enable_webhook is true"
+  type        = string
+  default     = ""
+}
+
+variable "webhook_enroll_provisioner" {
+  description = "Name of the SCEP provisioner used for enrollment (phrase challenge, single use, pins the host's key). Keeps the existing name so current scripts and URLs still work"
+  type        = string
+  default     = "device-trust-scep"
+}
+
+variable "webhook_renew_provisioner" {
+  description = "Name of the SCEP provisioner used for renewal (allowed only with the key the host enrolled with, no phrase)"
+  type        = string
+  default     = "device-trust-scep-renew"
+}
+
+variable "scep_cert_lifetime" {
+  description = "Lifetime of the device certificates SCEP issues, as a Go duration such as \"1080h\" (45 days). Empty keeps step-ca's default of 24 hours. Applies to both SCEP provisioners"
+  type        = string
+  default     = ""
+}
+
+variable "webhook_devices" {
+  description = "Allowlist of devices as lines of HOSTNAME,SERIAL[,note]. A sync job can instead add new versions of the allowlist secret; the VM re-reads it every few minutes"
+  type        = string
+  default     = ""
+}
+
+# CA teardown knobs. Defaults are the safe production values; override all three
+# (on both CAs) only to destroy a test environment.
+variable "ca_deletion_protection" {
+  description = "Refuse to delete the root and intermediate CAs"
+  type        = bool
+  default     = true
+}
+
+variable "ca_skip_grace_period" {
+  description = "Delete the CAs immediately instead of keeping them in DELETED state for 30 days"
+  type        = bool
+  default     = false
+}
+
+variable "ca_ignore_active_certificates_on_deletion" {
+  description = "Allow deleting CAs that still have unexpired, unrevoked certificates"
+  type        = bool
+  default     = false
+}
+
 # Output Variables
 output "root_ca_id" {
   description = "ID of the root CA"

@@ -20,8 +20,11 @@ resource "google_privateca_certificate_authority" "intermediate_ca" {
   # CA certificate lifetime (default: 5 years)
   lifetime = var.lifetime
 
-  # Deletion protection for security
-  deletion_protection = true
+  # Deletion protection for security. The teardown knobs below exist so a test
+  # environment can be destroyed; they default to the safe values.
+  deletion_protection                    = var.deletion_protection
+  skip_grace_period                      = var.skip_grace_period
+  ignore_active_certificates_on_deletion = var.ignore_active_certificates_on_deletion
 
   # Subject
   config {

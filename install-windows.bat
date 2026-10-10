@@ -15,6 +15,19 @@ set CERT_FRIENDLY_NAME=Device Trust Certificate
 REM KEY_PROTECTION: Delete (default) or RestrictPermissions - see Readme.md
 if not defined KEY_PROTECTION set KEY_PROTECTION=Delete
 
+REM Per-device SCEP challenges (optional, needs the webhook in
+REM webhook/README.md; leave these unset and this script behaves exactly as it
+REM always has, sending the single static SCEP_CHALLENGE to SCEP_PROVISIONER):
+REM   SCEP_PHRASE             the current enrollment phrase; the challenge sent is
+REM                           then computed from this PC's serial number
+REM   SCEP_RENEW_PROVISIONER  the renewal provisioner (device-trust-scep-renew with
+REM                           the Terraform webhook); used when the key from the
+REM                           last run is still on disk (RestrictPermissions)
+REM   SCEP_ATTEMPTS           how often a failed scepclient call is tried (default 3);
+REM                           scepclient occasionally fails on its own signature
+REM                           before the request reaches step-ca
+if not defined SCEP_ATTEMPTS set SCEP_ATTEMPTS=3
+
 REM Renewal state is tracked via the certificate store (by FriendlyName)
 REM rather than loose files, since KeyProtection=Delete removes the loose
 REM files but the store entry persists.
@@ -67,6 +80,10 @@ REM below), scepclient generates a new key but submits the old cached CSR -
 REM producing a cert that doesn't match the new key (certutil "NTE_BAD_KEY"
 REM on import). Cleared below whenever there's no key for it to match.
 set CSR_CACHE_FILE=%CERT_DIR%\csr.pem
+REM Is the key from the last run still on disk? Only then can this run reuse it
+REM (KEY_PROTECTION=Delete removes it, so every run starts a new key).
+set HAVE_KEY=0
+if exist "%PRIVATE_KEY_FILE%" if exist "%CERT_FILE%" set HAVE_KEY=1
 
 REM Detect hostname for DNS name
 for /f "tokens=*" %%i in ('hostname') do set HOSTNAME=%%i
@@ -178,28 +195,80 @@ echo.
 REM Build scepclient command
 set SCEPTOOL=%INSTALL_DIR%\scepclient.exe
 set STEPTOOL=%INSTALL_DIR%\step.exe
-set SERVER_URL=%SCEP_SERVER_URL%/scep/%SCEP_PROVISIONER%
 set DNS_NAME=%HOSTNAME%
 set COMMON_NAME=%HOSTNAME%
 
-echo Command:
-echo "%SCEPTOOL%" -private-key "%PRIVATE_KEY_FILE%" -certificate "%CERT_FILE%" -server-url "%SERVER_URL%" -challenge "%SCEP_CHALLENGE%" -dnsname "%DNS_NAME%" -cn "%COMMON_NAME%" -country "%CERT_COUNTRY%" -organization "%CERT_ORGANIZATION%" -ou "%CERT_OU%"
+REM Renew with the key from the last run when we can (webhook mode); otherwise
+REM enroll. Without SCEP_PHRASE and SCEP_RENEW_PROVISIONER this is the original
+REM behaviour: one provisioner, the static challenge.
+set ACTION=enroll
+set ACTIVE_PROVISIONER=%SCEP_PROVISIONER%
+set ACTIVE_CHALLENGE=%SCEP_CHALLENGE%
+if defined SCEP_RENEW_PROVISIONER if "%HAVE_KEY%"=="1" goto :action_renew
+if defined SCEP_PHRASE (
+    call :compute_challenge
+    if errorlevel 1 (
+        echo Error: could not build the per-device challenge from this PC's serial number
+        pause
+        exit /b 1
+    )
+    set ACTIVE_CHALLENGE=!COMPUTED_CHALLENGE!
+)
+goto :action_ready
+:action_renew
+set ACTION=renew
+set ACTIVE_PROVISIONER=%SCEP_RENEW_PROVISIONER%
+set ACTIVE_CHALLENGE=not-used-for-renewal
+:action_ready
 
-REM If there's no private key for scepclient to reuse, it's about to
-REM generate a brand-new one - clear any cached csr.pem left over from a
-REM prior run so scepclient can't silently resubmit a CSR that no longer
-REM matches the new key (see CSR_CACHE_FILE above).
-if not exist "%PRIVATE_KEY_FILE%" if exist "%CSR_CACHE_FILE%" del "%CSR_CACHE_FILE%"
+echo Action: %ACTION% via provisioner %ACTIVE_PROVISIONER% ^(the challenge itself is not printed^)
+echo Command:
+echo "%SCEPTOOL%" -private-key "%PRIVATE_KEY_FILE%" -certificate "%CERT_FILE%" -server-url "%SCEP_SERVER_URL%/scep/%ACTIVE_PROVISIONER%" -challenge "<redacted>" -dnsname "%DNS_NAME%" -cn "%COMMON_NAME%" -country "%CERT_COUNTRY%" -organization "%CERT_ORGANIZATION%" -ou "%CERT_OU%"
+
+REM scepclient caches its CSR - challenge included - next to the key and silently
+REM resends it, ignoring a new -challenge. :run_scep therefore clears it before
+REM every request.
+REM scepclient also keeps a self-signed signer certificate (self.pem) next to the
+REM key and signs every request with it; a new key signed against an old self.pem
+REM fails with "crypto/rsa: verification error", so it goes whenever the key does.
+REM Remember whether a key existed, so a failed first enrollment
+REM can remove the key it just made instead of leaving it behind.
+set KEY_BEFORE_RUN=0
+if exist "%PRIVATE_KEY_FILE%" set KEY_BEFORE_RUN=1
 
 REM No file-based backup/restore needed here - the old certificate store
 REM entry, if any, isn't touched until the new one has been imported
 REM successfully further down.
-"%SCEPTOOL%" -private-key "%PRIVATE_KEY_FILE%" -certificate "%CERT_FILE%" -server-url "%SERVER_URL%" -challenge "%SCEP_CHALLENGE%" -dnsname "%DNS_NAME%" -cn "%COMMON_NAME%" -country "%CERT_COUNTRY%" -organization "%CERT_ORGANIZATION%" -ou "%CERT_OU%"
+set SCEP_FAILED=0
+call :run_scep "%PRIVATE_KEY_FILE%" "%CERT_FILE%" "%ACTIVE_PROVISIONER%" "%ACTIVE_CHALLENGE%"
+if errorlevel 1 set SCEP_FAILED=1
 
-if %errorLevel% neq 0 (
+REM A refused renewal (for example an administrator cleared this PC's pin, or
+REM the PC was replaced) falls back to enrolling with a brand-new key, if a
+REM phrase is available. It runs in a scratch directory so the current key and
+REM certificate stay untouched until the new ones have actually been issued.
+if "%SCEP_FAILED%"=="1" if "%ACTION%"=="renew" if defined SCEP_PHRASE (
+    echo Renewal was refused - enrolling with a new key and the phrase instead.
+    set ACTION=enroll
+    set FALLBACK_DIR=%CERT_DIR%\enroll-%RANDOM%%RANDOM%
+    mkdir "!FALLBACK_DIR!"
+    call :compute_challenge
+    call :run_scep "!FALLBACK_DIR!\client.key" "!FALLBACK_DIR!\client.crt" "%SCEP_PROVISIONER%" "!COMPUTED_CHALLENGE!"
+    if not errorlevel 1 if exist "!FALLBACK_DIR!\client.crt" (
+        move /y "!FALLBACK_DIR!\client.key" "%PRIVATE_KEY_FILE%" >nul
+        move /y "!FALLBACK_DIR!\client.crt" "%CERT_FILE%" >nul
+        del "%CSR_CACHE_FILE%" 2>nul
+        set SCEP_FAILED=0
+    )
+    rmdir /s /q "!FALLBACK_DIR!"
+)
+
+if "%SCEP_FAILED%"=="1" (
     echo.
     echo Error: Certificate request failed!
     echo Please check your SCEP server URL, challenge, and root CA installation.
+    REM The key was made for this attempt and has no certificate: don't leave it.
+    if "%KEY_BEFORE_RUN%"=="0" del "%PRIVATE_KEY_FILE%" "%CSR_CACHE_FILE%" "%CERT_DIR%\self.pem" 2>nul
     if "%IS_RENEWAL%"=="1" echo The existing certificate in Cert:\CurrentUser\My was not touched.
     pause
     exit /b 1
@@ -280,6 +349,7 @@ if /i "%KEY_PROTECTION%"=="Delete" (
     del "%PRIVATE_KEY_FILE%" 2>nul
     del "%CERT_FILE%" 2>nul
     del "%CSR_CACHE_FILE%" 2>nul
+    del "%CERT_DIR%\self.pem" 2>nul
     echo Deleted the loose private key and certificate files. The next renewal will generate a new key ^(full re-enrollment^).
 ) else (
     REM RestrictPermissions: keep the key file in place ^(so scepclient
@@ -319,3 +389,36 @@ echo Full chain ^(public data^): %FULL_CHAIN_FILE%
 echo.
 
 pause
+goto :eof
+
+REM ---------------------------------------------------------------------------
+REM :compute_challenge - builds the per-device challenge from SCEP_PHRASE and this
+REM PC's serial number (DEVICE_SERIAL overrides the BIOS lookup for virtual
+REM machines and test rigs) into COMPUTED_CHALLENGE. The PowerShell has no inner
+REM double quotes so it survives the cmd quoting.
+:compute_challenge
+set COMPUTED_CHALLENGE=
+for /f "usebackq delims=" %%c in (`powershell -NoProfile -Command "$s = if ($env:DEVICE_SERIAL) { $env:DEVICE_SERIAL } else { (Get-CimInstance Win32_BIOS).SerialNumber }; $s = $s.Trim().ToUpperInvariant(); if (-not $s) { exit 1 }; $h = New-Object System.Security.Cryptography.HMACSHA256; $h.Key = [Text.Encoding]::UTF8.GetBytes($env:SCEP_PHRASE); [Convert]::ToBase64String($h.ComputeHash([Text.Encoding]::UTF8.GetBytes('device-trust-scep-challenge-v1' + [char]10 + $s)))"`) do set COMPUTED_CHALLENGE=%%c
+if not defined COMPUTED_CHALLENGE exit /b 1
+exit /b 0
+
+REM ---------------------------------------------------------------------------
+REM :run_scep <key-file> <cert-file> <provisioner> <challenge>
+REM One scepclient request, tried up to SCEP_ATTEMPTS times. scepclient signs each
+REM request with a throwaway certificate whose validity starts "now", and step-ca
+REM occasionally rejects a signing time that lands just outside it before the
+REM request reaches the webhook. Retrying a request that really was refused is
+REM harmless; only an allowed request uses up a phrase. (ping is the sleep: the
+REM timeout command fails without an interactive console.)
+:run_scep
+set SCEP_TRY=1
+:run_scep_try
+del "%~dp1csr.pem" 2>nul
+if not exist "%~1" del "%~dp1self.pem" 2>nul
+"%SCEPTOOL%" -private-key "%~1" -certificate "%~2" -server-url "%SCEP_SERVER_URL%/scep/%~3" -challenge "%~4" -dnsname "%DNS_NAME%" -cn "%COMMON_NAME%" -country "%CERT_COUNTRY%" -organization "%CERT_ORGANIZATION%" -ou "%CERT_OU%"
+if %errorLevel% equ 0 exit /b 0
+if %SCEP_TRY% geq %SCEP_ATTEMPTS% exit /b 1
+echo scepclient attempt %SCEP_TRY% of %SCEP_ATTEMPTS% failed - retrying in 2 seconds
+set /a SCEP_TRY+=1
+ping -n 3 127.0.0.1 >nul
+goto :run_scep_try

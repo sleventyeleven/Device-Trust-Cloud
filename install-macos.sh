@@ -29,6 +29,45 @@ INTERMEDIATE_CA_FILE_SRC="${INTERMEDIATE_CA_FILE_SRC:-}"
 # own PASS/FAIL test.
 MTLS_GATEWAY_URL="${MTLS_GATEWAY_URL:-}"
 
+# Per-device SCEP challenges (optional, needs the webhook in webhook/README.md;
+# leave all four unset and this script behaves exactly as it always has,
+# sending the single static SCEP_CHALLENGE to SCEP_PROVISIONER):
+#   SCEP_PHRASE             The current enrollment phrase. The challenge sent is
+#                           then computed from this Mac's serial number:
+#                           base64(HMAC-SHA256(phrase, "device-trust-scep-challenge-v1\n" + SERIAL)).
+#   SCEP_RENEW_PROVISIONER  The renewal provisioner (device-trust-scep-renew with
+#                           the Terraform webhook). When this is set and the key
+#                           from the last run is still on disk (KEY_PROTECTION=
+#                           RestrictPermissions), the run renews with that same
+#                           key and needs no phrase.
+#   SCEP_ATTEMPTS           How often a failed scepclient call is tried (default 3).
+#                           scepclient occasionally fails on its own signature
+#                           before the request reaches step-ca; a retry works and
+#                           retrying a refused request is harmless.
+SCEP_PHRASE="${SCEP_PHRASE:-}"
+SCEP_RENEW_PROVISIONER="${SCEP_RENEW_PROVISIONER:-}"
+SCEP_ATTEMPTS="${SCEP_ATTEMPTS:-3}"
+# What to do with the loose private key once it is in the keychain (same two
+# modes, and same default, as install-windows.ps1 -KeyProtection):
+#   Delete               Remove the key, certificate and cached CSR files after the
+#                        import. The key then lives only in the keychain
+#                        (non-exportable) and the next run is a full re-enrollment
+#                        with a new key. Default.
+#   RestrictPermissions  Keep the key (mode 600) so the next run can renew with the
+#                        same key. On macOS this does NOT hide the key from the
+#                        logged-in user: scepclient has to run as that user so it
+#                        can see the CA trust settings in their keychain, which
+#                        means the key must stay readable by them. Prefer Delete
+#                        for devices whose users you do not fully trust.
+KEY_PROTECTION="${KEY_PROTECTION:-Delete}"
+# Testing / air-gapped use: reuse scepclient and step already installed in
+# $INSTALL_DIR instead of downloading the latest releases every run.
+SKIP_TOOL_DOWNLOAD="${SKIP_TOOL_DOWNLOAD:-}"
+case "$KEY_PROTECTION" in
+    Delete|RestrictPermissions) ;;
+    *) printf "${RED}Error: KEY_PROTECTION must be Delete or RestrictPermissions (got '%s')${NC}\n" "$KEY_PROTECTION"; exit 1 ;;
+esac
+
 # This script needs root (via sudo -E) to write to /usr/local/bin, but the
 # root/intermediate CA trust settings, the device certificate/key, and the
 # scepclient process that requests them all need to run as the *actual
@@ -77,13 +116,21 @@ IS_RENEWAL=0
 if [ -f "$CERT_FILE" ]; then
     IS_RENEWAL=1
 fi
+# Is the key from the last run still here? Only then can this run reuse it
+# (KEY_PROTECTION=Delete removes it, so every run starts a new key).
+HAVE_KEY=0
+if [ -f "$PRIVATE_KEY_FILE" ] && [ -f "$CERT_FILE" ]; then
+    HAVE_KEY=1
+fi
 
 echo "========================================"
 echo "Device Trust Certificate Installation"
 echo "========================================"
 echo ""
-if [ "$IS_RENEWAL" -eq 1 ]; then
-    printf "${YELLOW}Existing device certificate found - this run will renew it (same key).${NC}\n"
+if [ "$HAVE_KEY" -eq 1 ]; then
+    printf "${YELLOW}Existing device certificate and key found - this run will renew it (same key).${NC}\n"
+elif [ "$IS_RENEWAL" -eq 1 ]; then
+    printf "${YELLOW}Existing device certificate found but no key to reuse - this run enrolls with a new key.${NC}\n"
 else
     printf "${YELLOW}No existing device certificate found - this is a first-time enrollment.${NC}\n"
 fi
@@ -102,6 +149,8 @@ esac
 echo "Configuration:"
 echo "- SCEP Server: $SCEP_SERVER_URL"
 echo "- Provisioner: $SCEP_PROVISIONER"
+[ -n "$SCEP_RENEW_PROVISIONER" ] && echo "- Renewal provisioner: $SCEP_RENEW_PROVISIONER"
+echo "- Key protection: $KEY_PROTECTION"
 echo "- Hostname: $HOSTNAME"
 echo "- Architecture: $(uname -m) (using scepclient-darwin-${SCEP_ARCH})"
 echo "- Target user: $TARGET_USER"
@@ -126,51 +175,56 @@ fetch_url() {
 # (scepclient-darwin-<arch>-vX.Y.Z.zip) containing the scepclient-darwin-<arch>
 # binary, so the asset must be discovered via the GitHub API rather than a
 # fixed URL (no unversioned asset exists to link directly).
-echo "Downloading scepclient for macOS (${SCEP_ARCH})..."
+if [ -n "$SKIP_TOOL_DOWNLOAD" ] && [ -x "$INSTALL_DIR/scepclient" ] && [ -x "$INSTALL_DIR/step" ]; then
+    echo "SKIP_TOOL_DOWNLOAD is set: using the scepclient and step already in $INSTALL_DIR."
+    STEP_TOOL="$INSTALL_DIR/step"
+else
+    echo "Downloading scepclient for macOS (${SCEP_ARCH})..."
 
-RELEASE_JSON=$(curl -sL "https://api.github.com/repos/micromdm/scep/releases/latest" 2>/dev/null || wget -qO- "https://api.github.com/repos/micromdm/scep/releases/latest")
-ASSET_URL=$(echo "$RELEASE_JSON" | grep -o "\"browser_download_url\": *\"[^\"]*scepclient-darwin-${SCEP_ARCH}-[^\"]*\.zip\"" | head -1 | grep -o 'https://[^"]*')
+    RELEASE_JSON=$(curl -sL "https://api.github.com/repos/micromdm/scep/releases/latest" 2>/dev/null || wget -qO- "https://api.github.com/repos/micromdm/scep/releases/latest")
+    ASSET_URL=$(echo "$RELEASE_JSON" | grep -o "\"browser_download_url\": *\"[^\"]*scepclient-darwin-${SCEP_ARCH}-[^\"]*\.zip\"" | head -1 | grep -o 'https://[^"]*')
 
-if [ -z "$ASSET_URL" ]; then
-    printf "${RED}Error: could not find a scepclient-darwin-${SCEP_ARCH} release asset${NC}\n"
-    exit 1
+    if [ -z "$ASSET_URL" ]; then
+        printf "${RED}Error: could not find a scepclient-darwin-${SCEP_ARCH} release asset${NC}\n"
+        exit 1
+    fi
+
+    # A directory template, not "prefix.XXXXXX.zip" - macOS's BSD mktemp
+    # doesn't reliably substitute the X's when followed by a literal suffix
+    # (confirmed live elsewhere in this script - see the PKCS#12 packaging
+    # section below), silently reusing the same fixed path across runs.
+    TMP_DL_DIR=$(mktemp -d -t scepclient-dl.XXXXXX)
+    TMP_ZIP="${TMP_DL_DIR}/scepclient.zip"
+    fetch_url "$ASSET_URL" "$TMP_ZIP"
+    unzip -o -q "$TMP_ZIP" -d "$INSTALL_DIR"
+    mv "$INSTALL_DIR/scepclient-darwin-${SCEP_ARCH}" "$INSTALL_DIR/scepclient"
+    rm -rf "$TMP_DL_DIR"
+    chmod +x "$INSTALL_DIR/scepclient"
+
+    printf "${GREEN}scepclient downloaded successfully${NC}\n"
+    echo ""
+
+    # Download step CLI (smallstep's own tool). Used purely for its
+    # "certificate p12" subcommand, to combine scepclient's PEM cert+key(+chain)
+    # into a PKCS#12 bundle that `security import` can load into the keychain -
+    # same reasoning as the Windows script's use of step for its PFX packaging.
+    echo "Downloading step CLI (${SCEP_ARCH})..."
+    STEP_TOOL="$INSTALL_DIR/step"
+    TMP_STEP_DIR=$(mktemp -d -t step-extract.XXXXXX)
+    TMP_TAR="${TMP_STEP_DIR}/step.tar.gz"
+    fetch_url "https://dl.smallstep.com/cli/docs-cli-install/latest/step_darwin_${SCEP_ARCH}.tar.gz" "$TMP_TAR"
+    tar -xzf "$TMP_TAR" -C "$TMP_STEP_DIR"
+    STEP_BIN_PATH=$(find "$TMP_STEP_DIR" -type f -name step -perm -u+x | head -1)
+    if [ -z "$STEP_BIN_PATH" ]; then
+        STEP_BIN_PATH=$(find "$TMP_STEP_DIR" -type f -name step | head -1)
+    fi
+    cp "$STEP_BIN_PATH" "$STEP_TOOL"
+    chmod +x "$STEP_TOOL"
+    rm -rf "$TMP_TAR" "$TMP_STEP_DIR"
+
+    printf "${GREEN}step CLI downloaded successfully${NC}\n"
+    echo ""
 fi
-
-# A directory template, not "prefix.XXXXXX.zip" - macOS's BSD mktemp
-# doesn't reliably substitute the X's when followed by a literal suffix
-# (confirmed live elsewhere in this script - see the PKCS#12 packaging
-# section below), silently reusing the same fixed path across runs.
-TMP_DL_DIR=$(mktemp -d -t scepclient-dl.XXXXXX)
-TMP_ZIP="${TMP_DL_DIR}/scepclient.zip"
-fetch_url "$ASSET_URL" "$TMP_ZIP"
-unzip -o -q "$TMP_ZIP" -d "$INSTALL_DIR"
-mv "$INSTALL_DIR/scepclient-darwin-${SCEP_ARCH}" "$INSTALL_DIR/scepclient"
-rm -rf "$TMP_DL_DIR"
-chmod +x "$INSTALL_DIR/scepclient"
-
-printf "${GREEN}scepclient downloaded successfully${NC}\n"
-echo ""
-
-# Download step CLI (smallstep's own tool). Used purely for its
-# "certificate p12" subcommand, to combine scepclient's PEM cert+key(+chain)
-# into a PKCS#12 bundle that `security import` can load into the keychain -
-# same reasoning as the Windows script's use of step for its PFX packaging.
-echo "Downloading step CLI (${SCEP_ARCH})..."
-STEP_TOOL="$INSTALL_DIR/step"
-TMP_STEP_DIR=$(mktemp -d -t step-extract.XXXXXX)
-TMP_TAR="${TMP_STEP_DIR}/step.tar.gz"
-fetch_url "https://dl.smallstep.com/cli/docs-cli-install/latest/step_darwin_${SCEP_ARCH}.tar.gz" "$TMP_TAR"
-tar -xzf "$TMP_TAR" -C "$TMP_STEP_DIR"
-STEP_BIN_PATH=$(find "$TMP_STEP_DIR" -type f -name step -perm -u+x | head -1)
-if [ -z "$STEP_BIN_PATH" ]; then
-    STEP_BIN_PATH=$(find "$TMP_STEP_DIR" -type f -name step | head -1)
-fi
-cp "$STEP_BIN_PATH" "$STEP_TOOL"
-chmod +x "$STEP_TOOL"
-rm -rf "$TMP_TAR" "$TMP_STEP_DIR"
-
-printf "${GREEN}step CLI downloaded successfully${NC}\n"
-echo ""
 
 # Install root CA certificate
 echo "Installing root CA certificate..."
@@ -310,12 +364,81 @@ echo ""
 
 # Build scepclient command
 SCEPTOOL="$INSTALL_DIR/scepclient"
-SERVER_URL="${SCEP_SERVER_URL}/scep/${SCEP_PROVISIONER}"
 DNS_NAME="$HOSTNAME"
 COMMON_NAME="$HOSTNAME"
 
+# This Mac's serial number, as the server's allowlist records it: trimmed and
+# upper-cased. DEVICE_SERIAL overrides the hardware lookup (virtual machines
+# and test rigs that have no IOPlatformSerialNumber).
+device_serial() {
+    if [ -n "${DEVICE_SERIAL:-}" ]; then
+        printf '%s' "$DEVICE_SERIAL"
+    else
+        ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformSerialNumber/{print $4}'
+    fi
+}
+phrase_challenge() {
+    local serial
+    serial=$(device_serial | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:lower:]' '[:upper:]')
+    if [ -z "$serial" ]; then
+        printf "${RED}Error: could not read this Mac's serial number to build the per-device challenge${NC}\n" >&2
+        return 1
+    fi
+    printf 'device-trust-scep-challenge-v1\n%s' "$serial" | openssl dgst -sha256 -hmac "$SCEP_PHRASE" -binary | openssl base64 -A
+}
+
+# Renew with the key from the last run when we can (webhook mode); otherwise
+# enroll. Without SCEP_PHRASE and SCEP_RENEW_PROVISIONER this is the original
+# behaviour: one provisioner, the static challenge.
+ACTION=enroll
+ACTIVE_PROVISIONER="$SCEP_PROVISIONER"
+ACTIVE_CHALLENGE="$SCEP_CHALLENGE"
+if [ -n "$SCEP_RENEW_PROVISIONER" ] && [ "$HAVE_KEY" -eq 1 ]; then
+    ACTION=renew
+    ACTIVE_PROVISIONER="$SCEP_RENEW_PROVISIONER"
+    ACTIVE_CHALLENGE="not-used-for-renewal"      # the renewal path ignores it
+elif [ -n "$SCEP_PHRASE" ]; then
+    ACTIVE_CHALLENGE=$(phrase_challenge)
+fi
+
+# scepclient caches its CSR - challenge included - next to the key and silently
+# resends it, ignoring a new -challenge. run_scepclient therefore clears it
+# before every request.
+# scepclient also keeps a self-signed signer certificate (self.pem) next to the
+# key and signs every request with it; a new key signed against an old self.pem
+# fails with "crypto/rsa: verification error", so it goes whenever the key does.
+# Remember whether a key existed, so a failed first
+# enrollment can remove the key it just made instead of leaving it behind.
+KEY_BEFORE_RUN=0
+if [ -f "$PRIVATE_KEY_FILE" ]; then
+    KEY_BEFORE_RUN=1
+fi
+
+# One scepclient attempt, run as $TARGET_USER (see the long comment further
+# down). Retries a failed call: scepclient signs each request with a throwaway
+# certificate whose validity starts "now", and step-ca occasionally rejects a
+# signing time that lands just outside it before the request reaches the
+# webhook. Retrying a request that really was refused is harmless; only an
+# allowed request uses up a phrase.
+# usage: run_scepclient <key-file> <cert-file> <provisioner> <challenge>
+run_scepclient() {
+    local attempt=1 rc
+    while :; do
+        rm -f "$(dirname "$1")/csr.pem"
+        [ -f "$1" ] || rm -f "$(dirname "$1")/self.pem"
+        sudo -u "$TARGET_USER" "$SCEPTOOL" -private-key "$1" -certificate "$2" -server-url "${SCEP_SERVER_URL}/scep/$3" -challenge "$4" -dnsname "$DNS_NAME" -cn "$COMMON_NAME" -country "$CERT_COUNTRY" -organization "$CERT_ORGANIZATION" -ou "$CERT_OU"
+        rc=$?
+        [ $rc -eq 0 ] && return 0
+        [ "$attempt" -ge "$SCEP_ATTEMPTS" ] && return $rc
+        printf "${YELLOW}scepclient attempt %s of %s failed - retrying in 2 seconds${NC}\n" "$attempt" "$SCEP_ATTEMPTS" >&2
+        attempt=$((attempt + 1))
+        sleep 2
+    done
+}
+
+echo "Action: $ACTION via provisioner $ACTIVE_PROVISIONER (the challenge itself is not printed)"
 echo "Command:"
-echo "$SCEPTOOL" -private-key "$PRIVATE_KEY_FILE" -certificate "$CERT_FILE" -server-url "$SERVER_URL" -challenge "$SCEP_CHALLENGE" -dnsname "$DNS_NAME" -cn "$COMMON_NAME" -country "$CERT_COUNTRY" -organization "$CERT_ORGANIZATION" -ou "$CERT_OU"
+echo "$SCEPTOOL" -private-key "$PRIVATE_KEY_FILE" -certificate "$CERT_FILE" -server-url "${SCEP_SERVER_URL}/scep/${ACTIVE_PROVISIONER}" -challenge "<redacted>" -dnsname "$DNS_NAME" -cn "$COMMON_NAME" -country "$CERT_COUNTRY" -organization "$CERT_ORGANIZATION" -ou "$CERT_OU"
 
 echo ""
 
@@ -336,14 +459,38 @@ fi
 # $CERT_DIR is owned by $TARGET_USER (see above) specifically so this can
 # write client.key/client.crt there without needing root for every run.
 set +e
-sudo -u "$TARGET_USER" "$SCEPTOOL" -private-key "$PRIVATE_KEY_FILE" -certificate "$CERT_FILE" -server-url "$SERVER_URL" -challenge "$SCEP_CHALLENGE" -dnsname "$DNS_NAME" -cn "$COMMON_NAME" -country "$CERT_COUNTRY" -organization "$CERT_ORGANIZATION" -ou "$CERT_OU"
+run_scepclient "$PRIVATE_KEY_FILE" "$CERT_FILE" "$ACTIVE_PROVISIONER" "$ACTIVE_CHALLENGE"
 SCEP_EXIT=$?
+
+# A refused renewal (for example an administrator cleared this Mac's pin, or the
+# Mac was replaced) falls back to enrolling with a brand-new key, if a phrase
+# is available. It runs in a scratch directory so the current key and
+# certificate stay untouched until the new ones have actually been issued.
+if [ $SCEP_EXIT -ne 0 ] && [ "$ACTION" = "renew" ] && [ -n "$SCEP_PHRASE" ]; then
+    printf "${YELLOW}Renewal was refused - enrolling with a new key and the phrase instead.${NC}\n"
+    ACTION=enroll
+    FALLBACK_DIR=$(sudo -u "$TARGET_USER" mktemp -d "${CERT_DIR}/enroll-work.XXXXXX")
+    FALLBACK_CHALLENGE=$(phrase_challenge)
+    run_scepclient "$FALLBACK_DIR/client.key" "$FALLBACK_DIR/client.crt" "$SCEP_PROVISIONER" "$FALLBACK_CHALLENGE"
+    SCEP_EXIT=$?
+    if [ $SCEP_EXIT -eq 0 ] && [ -s "$FALLBACK_DIR/client.crt" ]; then
+        mv -f "$FALLBACK_DIR/client.key" "$PRIVATE_KEY_FILE"
+        mv -f "$FALLBACK_DIR/client.crt" "$CERT_FILE"
+        rm -f "${CERT_DIR}/csr.pem"
+        chown "$TARGET_USER" "$PRIVATE_KEY_FILE" "$CERT_FILE"
+    fi
+    rm -rf "$FALLBACK_DIR"
+fi
 set -e
 
 if [ $SCEP_EXIT -ne 0 ]; then
     echo ""
     printf "${RED}Error: Certificate request failed!${NC}\n"
     echo "Please check your SCEP server URL, challenge, and root CA installation."
+    if [ "$KEY_BEFORE_RUN" -eq 0 ]; then
+        # The key was made for this attempt and has no certificate: don't leave it.
+        rm -f "$PRIVATE_KEY_FILE" "${CERT_DIR}/csr.pem" "${CERT_DIR}/self.pem"
+    fi
     if [ -f "$BACKUP_CERT_FILE" ]; then
         printf "${YELLOW}Restoring previous certificate - it was not replaced.${NC}\n"
         cp "$BACKUP_CERT_FILE" "$CERT_FILE"
@@ -549,13 +696,29 @@ else
     echo "Skipping mTLS test (MTLS_GATEWAY_URL not set)."
 fi
 
+# Apply the chosen key protection to the loose PEM files. This comes after the
+# mTLS test because that test uses the PEM files directly.
+CERT_SUBJECT=$(openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | sed 's/subject= *//')
+echo ""
+echo "Applying key protection mode: $KEY_PROTECTION"
+if [ "$KEY_PROTECTION" = "Delete" ]; then
+    rm -f "$PRIVATE_KEY_FILE" "$CERT_FILE" "${CERT_DIR}/csr.pem" "${CERT_DIR}/self.pem"
+    printf "${GREEN}Deleted the loose private key, certificate and cached CSR. The key now lives only in the keychain (non-exportable); the next run enrolls with a new key.${NC}\n"
+else
+    chmod 700 "$CERT_DIR"
+    chmod 600 "$PRIVATE_KEY_FILE"
+    printf "${GREEN}Kept the key for same-key renewal, mode 600 in a mode 700 directory.${NC}\n"
+    printf "${YELLOW}Note: on macOS it stays readable by ${TARGET_USER}. Use KEY_PROTECTION=Delete where that is not acceptable.${NC}\n"
+fi
+
 echo ""
 echo "========================================"
 printf "${GREEN}Installation Successful!${NC}\n"
 echo "========================================"
 echo ""
-echo "Certificate installed in: ${TARGET_USER}'s login keychain (label: $(openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | sed 's/subject= *//'))"
+echo "Certificate installed in: ${TARGET_USER}'s login keychain (label: $CERT_SUBJECT)"
 echo "Full chain (public data): $FULL_CHAIN_FILE"
+echo "Key protection: $KEY_PROTECTION"
 if [ -n "$MTLS_TEST_RESULT" ]; then
     echo "mTLS gateway test: $MTLS_TEST_RESULT"
 fi

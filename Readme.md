@@ -38,6 +38,10 @@ trust certificate enrollment over SCEP.
    `true`) - see the "mTLS Test Gateway" section below
 9. **Main Configuration** - Orchestrates all modules, enables required GCP
    APIs, and manages cross-module IAM
+10. **Per-device challenge webhook (optional)** - `webhook/`, a small Go
+   service that runs next to step-ca and replaces the single shared SCEP
+   challenge with one challenge per device, plus key-pinned renewals. Off by
+   default (`enable_webhook`); see "Per-Device SCEP Challenges" below
 
 ## Features
 
@@ -50,6 +54,9 @@ trust certificate enrollment over SCEP.
   default; the step-ca service account only holds what it actually uses
 - **ACME DNS validation**: optional, for Let's Encrypt-style domain
   validation flows unrelated to the SCEP path
+- **Per-device SCEP challenges (optional)**: a short-lived phrase combined
+  with each device's serial number instead of one shared, long-lived
+  challenge, with renewals that need no secret at all
 
 ## Prerequisites
 
@@ -102,6 +109,20 @@ and request a device certificate over SCEP. They take the SCEP server URL,
 provisioner name, challenge, and root CA (as a URL or a local file) as
 environment variables or (PowerShell only) named parameters - see
 `config.sh` for the full variable list and where each value comes from.
+
+All three scripts take the same four optional settings for the
+[per-device challenge webhook](#per-device-scep-challenges-optional), and
+behave exactly as before when they are unset:
+
+| Setting | Meaning |
+|---|---|
+| `SCEP_PHRASE` / `-ScepPhrase` | The current enrollment phrase. The script reads the device's serial number and computes the challenge itself (`DEVICE_SERIAL` overrides the lookup for virtual machines) |
+| `SCEP_RENEW_PROVISIONER` / `-RenewProvisioner` | The renewal provisioner (`device-trust-scep-renew`). Used instead of enrolling when the key from the last run is still on disk, so renewal needs no phrase |
+| `KEY_PROTECTION` / `-KeyProtection` | `Delete` (default) or `RestrictPermissions`; now on macOS too, see the sections below |
+| `SCEP_ATTEMPTS` / `-ScepAttempts` | Tries per `scepclient` call, default 3 (it occasionally fails on its own signature) |
+
+If a renewal is refused and a phrase is set, the script falls back to
+enrolling with a new key. The challenge is never printed.
 
 **These scripts should be treated as a best-effort starting point, not a
 fully tested, hardened deliverable.** `install-windows.ps1` and
@@ -221,17 +242,23 @@ non-working versions of this script - not just future ones.
 **A cosmetic macOS quirk to expect after cleanup:** the superseded
 certificate can still show up in Keychain Access afterward, "ghosted"
 (grayed out, no private key alongside it), rather than disappearing
-outright. This is harmless and doesn't affect anything: `scepclient`
-reuses the same private key across every renewal on macOS (there's no
-`-KeyProtection`-style Delete mode here, unlike Windows), so there's only
-ever one actual private key object in the keychain - Keychain Access pairs
-it with whichever certificate is current, and the old certificate we just
-deleted is left displayed as a bare certificate with no matching key.
-Without a private key, it isn't a usable identity, so it's **not** offered
-as a ClientAuth option in the browser's certificate picker either - the
-ghosting is purely a Keychain Access display artifact. If it bothers you,
-it can be removed manually from Keychain Access, but there's no functional
-reason to.
+outright. This is harmless and doesn't affect anything: with
+`KEY_PROTECTION=RestrictPermissions`, `scepclient` reuses the same private
+key across every renewal, so there's only ever one actual private key
+object in the keychain - Keychain Access pairs it with whichever
+certificate is current, and the old certificate we just deleted is left
+displayed as a bare certificate with no matching key. Without a private
+key, it isn't a usable identity, so it's **not** offered as a ClientAuth
+option in the browser's certificate picker either - the ghosting is purely
+a Keychain Access display artifact. If it bothers you, it can be removed
+manually from Keychain Access, but there's no functional reason to.
+
+With the default `KEY_PROTECTION=Delete` every run makes a new key, and the
+script removes the superseded *certificate* but not its private key, which
+stays in the keychain unused. It isn't offered for ClientAuth (there is no
+certificate to go with it), and it is non-exportable, but over many cycles
+those keys accumulate; remove them in Keychain Access if that matters to
+you. (This was not exercised on a real Mac; see below.)
 
 `sudo -E` (not plain `sudo`) is required - the script needs root to write to
 `/usr/local/bin`, but plain `sudo` resets the environment by default,
@@ -244,6 +271,24 @@ gateway's certificate consults whichever keychain belongs to the calling
 process's user, and root has no login keychain of its own. Certificate
 working files live in `~/.device-trust` (not `/etc`) for the same reason -
 that process needs to write there without being root.
+
+### macOS: the `KEY_PROTECTION` trade-off
+
+The macOS script has the same two modes as Windows, and `Delete` is the
+default there too. This changes what earlier versions did (they always kept
+the key): set `KEY_PROTECTION=RestrictPermissions` to get the old behaviour.
+
+| Mode | Behavior | Trade-off |
+|---|---|---|
+| `Delete` (default) | After the mTLS test, removes `client.key`, `client.crt`, `csr.pem` and `self.pem` from `~/.device-trust`; the identity lives only in the login keychain, imported with `-x` | The next run has no key to reuse, so it is a new enrollment with a new key and needs a phrase (with the webhook) |
+| `RestrictPermissions` | Keeps `client.key` in `~/.device-trust` (directory mode 700, key mode 600) | Same-key renewal with no phrase. **The key stays readable by the logged-in user**, because the script and `scepclient` run as that user, so unlike Windows this does not protect against the user themselves, only against other accounts |
+
+The loose files are deleted after the mTLS test, which uses them, so a
+`Delete` run still proves ClientAuth works before the key goes. The
+keychain import, `-x` flag and superseded-certificate removal are the
+unchanged parts of the script, the key-deletion step is new, and none of
+this has been run on a real Mac for this change (see
+[Per-Device SCEP Challenges](#per-device-scep-challenges-optional)).
 
 ### Windows: certificate store install and the `-KeyProtection` trade-off
 
@@ -273,14 +318,15 @@ After import, the script has to decide what to do with that loose key file
 | `Delete` (default) | Deletes `client.key`/`client.crt` after import | Matches "non-exportable" most literally, but the next renewal has no key to reuse - `scepclient` generates a **brand new key and requests a brand new certificate** every time, which is a full re-enrollment, not a lightweight renewal |
 | `RestrictPermissions` | Keeps `client.key` in place but locks its ACL to `SYSTEM` + `Administrators` (`icacls`), stripping the standard user's own read access | Lets `scepclient` reuse the same key on the next run (true same-key renewal, cheaper) - but an admin-level actor (or this script itself, which already requires admin) can still read the key file, so it's a weaker guarantee than `Delete` |
 
-**Why this matters for cost, not just security:** Google Cloud Private CA
-(CAS) bills **per certificate-issuance operation**, on top of the Enterprise
-pool's own monthly base fee. `Delete`'s forced full re-enrollment means a new
-CAS signing operation on every single renewal cycle; `RestrictPermissions`
-avoids that recurring cost by reusing the same key/cert lineage across
-renewals, at the cost of a weaker (ACL-based, not cryptographic) protection
-guarantee on the loose key file. Pick based on which you're actually
-optimizing for - there's no default that's strictly better on both axes.
+**What this does and doesn't change for cost:** Google Cloud Private CA
+(CAS) bills **per certificate issued** (about $0.50 each on the Enterprise
+tier), on top of the pool's monthly base fee. Both modes issue a new
+certificate on every renewal: a same-key renewal still produces a new
+certificate with a new serial number (confirmed end to end), so
+`RestrictPermissions` does not save a signing operation. What it changes is
+the key: it stays the same instead of rotating every cycle, and the device
+doesn't need a new enrollment secret each time. Pick based on which of those
+you are optimizing for - there's no default that's strictly better on both axes.
 
 ### mTLS Test Gateway
 
@@ -333,6 +379,41 @@ Challenge:   terraform output -raw scep_challenge_password
 CA cert:     terraform output -raw root_ca_certificate
 ```
 
+## Per-Device SCEP Challenges (optional)
+
+By default every device presents the same static SCEP challenge, so anyone
+who can read the install script on one endpoint can enroll any device. The
+optional webhook in [`webhook/`](webhook/README.md) replaces that:
+
+- **Enrollment** uses a short-lived phrase combined with the device's own
+  serial number (`base64(HMAC-SHA256(phrase, serial))`), only for hosts on an
+  allowlist, once per phrase per host. The same script runs on every endpoint;
+  only the phrase is passed in.
+- **Renewal** needs no secret: it is allowed only with the key the host
+  enrolled with, so a stolen phrase buys nothing.
+- You choose per device group whether the key stays on the device in a
+  locked-down directory (renewable, no monthly phrase) or is deleted after
+  import (a new key and phrase every cycle). `webhook/README.md` compares
+  them; the install scripts for macOS and Windows take `SCEP_PHRASE`,
+  `SCEP_RENEW_PROVISIONER` and `KEY_PROTECTION` to use either.
+
+Enable it in `terraform.tfvars`:
+
+```hcl
+enable_webhook      = true
+webhook_binary_path = "webhook/device-trust-webhook"   # CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build in webhook/
+scep_cert_lifetime  = "1080h"                           # 45 days; step-ca's default is 24 hours
+webhook_devices     = <<-EOT
+  # hostname,serial,note
+  ALICE-MBP,C02ABC123XYZ,Alice's MacBook
+EOT
+```
+
+This turns `device-trust-scep` into the enrollment provisioner, adds
+`device-trust-scep-renew`, and stops using the static challenge. Install
+scripts that still send it will be refused until they are updated, so roll it
+out deliberately. With `enable_webhook = false` (the default) nothing changes.
+
 ## Security Considerations
 
 - **Deletion protection** on both CAs
@@ -383,9 +464,9 @@ CA cert:     terraform output -raw root_ca_certificate
   prompt(s) when it runs.
 - **Stale local state from before a full CA destroy/rebuild breaks the next
   run - clean it up first.** Both `install-macos.sh` and `install-windows.ps1`
-  treat an existing private key/cert (`~/.device-trust/client.key` on macOS,
-  `Cert:\CurrentUser\My` with `-KeyProtection RestrictPermissions` on
-  Windows) as "renew this," and `scepclient` reuses that key/cert to make the
+  treat an existing private key/cert (`~/.device-trust/client.key` on macOS
+  and the key file on Windows, both only with `RestrictPermissions`; a
+  certificate in `Cert:\CurrentUser\My` on Windows) as "renew this," and `scepclient` reuses that key/cert to make the
   renewal request. That's correct for renewing against the *same* CA, but if
   the whole PKI hierarchy was destroyed and recreated in between (as when
   doing a `terraform destroy`/`apply` cycle for testing, not a normal
@@ -607,6 +688,26 @@ Separately: always invoke it as `./install-macos.sh` (after `chmod +x`) or
 handles some things (color output included) differently than the script
 expects.
 
+### The VM never started step-ca: `bad interpreter: /bin/bash^M`
+
+On a Windows checkout with `core.autocrlf=true` every file is checked out
+with CRLF line endings, and Terraform keeps the carriage returns inside
+heredocs and `templatefile()` output, so the VM's startup script begins with
+`#!/bin/bash\r`. The modules now strip them. If you see this on an older
+copy, run `sed -i 's/\r$//'` over the `.tf` files or check out with LF.
+
+### `terraform apply` fails with `404 Requested entity was not found` on every `google_privateca_certificate`
+
+Seen on the first `apply` of a fresh environment, right after the
+intermediate CA was created: the CA is not usable for issuance for a few
+seconds. A 60 second `time_sleep` now sits between the CA hierarchy and
+everything that issues from it; on an older copy, just run `apply` again.
+
+### Device certificates expire after 24 hours
+
+That is step-ca's default for SCEP provisioners. Set `scep_cert_lifetime`
+(for example `"1080h"` for 45 days) when you want something longer.
+
 ### VM startup / Docker issues
 
 - The step-ca VM has no external IP; if `docker` isn't installed or the
@@ -643,33 +744,40 @@ digging further.
 
 ## Cleanup
 
+Both CAs have `deletion_protection = true` by default, and CAS refuses to
+delete a CA that still has unexpired certificates, so a plain `terraform
+destroy` stops at them. To tear down a **test** environment, switch the
+protection off first and then destroy, passing the same values both times:
+
 ```bash
-terraform destroy
+FLAGS="-var ca_deletion_protection=false -var ca_skip_grace_period=true -var ca_ignore_active_certificates_on_deletion=true"
+terraform apply   $FLAGS     # updates the CAs in place; nothing is replaced
+terraform destroy $FLAGS
 ```
 
-Both CAs have `deletion_protection = true` - `destroy` will fail on them
-until you temporarily set `deletion_protection = false` on
-`modules/root_ca/main.tf` and `modules/intermediate_ca/main.tf` and apply
-that change first. You'll also want `skip_grace_period = true` and
-`ignore_active_certificates_on_deletion = true` alongside it, since CAS
-otherwise refuses to delete a CA that has ever issued a certificate still
-within its validity window (which, in this stack, is essentially always -
-step-ca's own SCEP decrypter cert, the gateway's TLS certs, and every
-enrolled device cert are all still "active" from CAS's point of view).
-Revert those back to `true`/defaults afterward if you plan to redeploy for
-real use - they're a genuine safety net, not just apply-time friction.
+`skip_grace_period` deletes the CAs immediately instead of keeping them in a
+DELETED state for 30 days (a deleted CA isn't billed during the grace period,
+but it can't be reused either way). Leave all three at their defaults for
+anything real: they are a genuine safety net.
 
 **Note:** This deletes all CA certificates and their associated data.
-Exercise caution. This full cycle (destroy, flip protection back, rebuild
-with bumped pool/template names per the Troubleshooting entry above) has
-been run end-to-end successfully, including a fresh SCEP enrollment and
-mTLS gateway test against the rebuilt stack.
+Exercise caution. Pool, template and CA names can never be reused after
+deletion (see the Troubleshooting entry above), so a rebuild needs new
+`ca_pool_name`, `root_ca_pool_name` and `certificate_template_name` values.
+Destroy does not disable the GCP APIs the stack enabled (that is free and
+harmless), and removes everything else, including the webhook's bucket,
+secrets and persistent disk when `enable_webhook` was on.
 
 ## Support
 
 - [Google Cloud Private CA Documentation](https://cloud.google.com/private-ca/docs/overview)
 - [step-ca Documentation](https://smallstep.com/docs/step-ca/)
-- [step-ca Registration Authority mode](https://smallstep.com/docs/step-ca/registration-authority-ca/)
+- [step-ca Registration Authority mode](https://smallstep.com/docs/step-ca/registration-authority-ra-mode/)
+- [step-ca webhooks](https://smallstep.com/docs/step-ca/webhooks/) and the
+  [SCEP provisioner](https://smallstep.com/docs/step-ca/provisioners/) (the `SCEPCHALLENGE` webhook
+  that the optional `webhook/` service implements)
+- [RFC 8894, Simple Certificate Enrolment Protocol](https://www.rfc-editor.org/rfc/rfc8894.html)
+- [Per-device challenge webhook](webhook/README.md) in this repository
 
 ## License
 
