@@ -4,44 +4,47 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/sleventyeleven/Device-Trust-Cloud/webhook/internal/testsecret"
 )
 
-const testPhrase = "Queen-Ate-Lamp-Wise-Smell"
+// Generated per test run; see the testsecret package.
+var (
+	testPhrase = testsecret.Phrase()
+	testSerial = testsecret.Serial()
+	testHost   = testsecret.Hostname()
+)
 
-// The expected values below were NOT produced by this package. They were
-// computed independently with OpenSSL 3.5.5:
-//
-//	printf 'device-trust-scep-challenge-v1\n%s' "$SERIAL" |
-//	  openssl dgst -sha256 -hmac "$PHRASE" -binary | openssl base64 -A
-//
-// and with Windows PowerShell 5.1 (.NET HMACSHA256), which agreed exactly.
-// They pin the formula so a server and its client scripts can never silently
-// drift apart.
-var knownAnswers = []struct {
-	name, id, want string
+// The expected values come from testsecret.Challenge, a separate
+// implementation of the documented formula that does not use this package. The
+// formula itself (the install scripts use OpenSSL and .NET HMACSHA256 for it)
+// is pinned end to end by the deployment tests, where a server only accepts
+// what the scripts compute.
+var challengeCases = []struct {
+	name, id string
 }{
-	{"mac style", "C02ABC123XYZ", "6ZR262r4trPJ6vKSEOgBATU4m8NXj97z0oOmBt/wo8c="},
-	{"serial with spaces", "TO BE FILLED BY O.E.M.", "n9JP3tnNTzNs6upeL3+Y6mLcqJGCvUmUd3O1RzRLRBw="},
-	{"windows bios style", "5CG1234ABC", "Iy1ZxsVc0+LSidy2uk8+B0v5o+8CmaU83JjWnWDEAtk="},
+	{"typical serial", testSerial},
+	{"serial with spaces", "TO BE FILLED BY O.E.M."},
+	{"another serial", testsecret.Serial()},
 }
 
-func TestComputeKnownAnswers(t *testing.T) {
-	for _, tc := range knownAnswers {
+func TestComputeMatchesTheDocumentedFormula(t *testing.T) {
+	for _, tc := range challengeCases {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := Compute(testPhrase, tc.id)
 			if err != nil {
 				t.Fatalf("Compute: %v", err)
 			}
-			if got != tc.want {
-				t.Errorf("Compute(%q) = %q, want %q", tc.id, got, tc.want)
+			if want := testsecret.Challenge(testPhrase, tc.id); got != want {
+				t.Errorf("Compute(%q) = %q, want %q", tc.id, got, want)
 			}
 		})
 	}
 }
 
 func TestComputeNormalizesID(t *testing.T) {
-	want, _ := Compute(testPhrase, "C02ABC123XYZ")
-	for _, raw := range []string{"c02abc123xyz", "  C02ABC123XYZ", "C02ABC123XYZ\r\n", "\tc02Abc123xYz \n"} {
+	want, _ := Compute(testPhrase, testSerial)
+	for _, raw := range []string{strings.ToLower(testSerial), "  " + testSerial, testSerial + "\r\n", "\t" + strings.ToLower(testSerial) + " \n"} {
 		got, err := Compute(testPhrase, raw)
 		if err != nil || got != want {
 			t.Errorf("Compute(%q) = %q, %v; want %q", raw, got, err, want)
@@ -50,11 +53,11 @@ func TestComputeNormalizesID(t *testing.T) {
 }
 
 func TestComputeSeparatesInputs(t *testing.T) {
-	base, _ := Compute(testPhrase, "C02ABC123XYZ")
+	base, _ := Compute(testPhrase, testSerial)
 	for name, other := range map[string]func() (string, error){
-		"serial":      func() (string, error) { return Compute(testPhrase, "C02ABC123XYY") },
-		"phrase":      func() (string, error) { return Compute("Queen-Ate-Lamp-Wise-Smelt", "C02ABC123XYZ") },
-		"phrase case": func() (string, error) { return Compute(strings.ToLower(testPhrase), "C02ABC123XYZ") },
+		"serial":      func() (string, error) { return Compute(testPhrase, testSerial+"X") },
+		"phrase":      func() (string, error) { return Compute(testPhrase+"x", testSerial) },
+		"phrase case": func() (string, error) { return Compute(strings.ToLower(testPhrase), testSerial) },
 	} {
 		if got, _ := other(); got == base {
 			t.Errorf("changing the %s did not change the challenge", name)
@@ -63,7 +66,7 @@ func TestComputeSeparatesInputs(t *testing.T) {
 }
 
 func TestComputeErrors(t *testing.T) {
-	if _, err := Compute("", "C02ABC123XYZ"); err == nil {
+	if _, err := Compute("", testSerial); err == nil {
 		t.Error("empty phrase: want error")
 	}
 	if _, err := Compute(testPhrase, "  "); err == nil {
@@ -73,10 +76,10 @@ func TestComputeErrors(t *testing.T) {
 
 func TestNormalizeSerial(t *testing.T) {
 	ok := map[string]string{
-		"abc123":                 "ABC123",
-		"  abc123 \r\n":          "ABC123",
-		"to be filled by o.e.m.": "TO BE FILLED BY O.E.M.",
-		"laptop-01.example.com":  "LAPTOP-01.EXAMPLE.COM",
+		strings.ToLower(testSerial):                  testSerial,
+		"  " + strings.ToLower(testSerial) + " \r\n": testSerial,
+		"to be filled by o.e.m.":                     "TO BE FILLED BY O.E.M.",
+		strings.ToLower(testHost) + ".example.com":   testHost + ".EXAMPLE.COM",
 	}
 	for in, want := range ok {
 		if got, err := NormalizeSerial(in); err != nil || got != want {
@@ -91,13 +94,13 @@ func TestNormalizeSerial(t *testing.T) {
 }
 
 func TestValidatePhrase(t *testing.T) {
-	for _, p := range []string{"Queen-Ate-Lamp-Wise-Smell", "x", "a-b"} {
+	for _, p := range []string{testPhrase, "x", "a-b"} {
 		if err := ValidatePhrase(p); err != nil {
 			t.Errorf("ValidatePhrase(%q) = %v", p, err)
 		}
 	}
 	for name, p := range map[string]string{
-		"empty": "", "space": "Queen Ate", "non ascii": "Smëll", "control": "a\x07b", "too long": strings.Repeat("a", MaxPhraseLen+1),
+		"empty": "", "space": "two words", "non ascii": "Smëll", "control": "a\x07b", "too long": strings.Repeat("a", MaxPhraseLen+1),
 	} {
 		err := ValidatePhrase(p)
 		if err == nil {

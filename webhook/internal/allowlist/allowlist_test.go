@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sleventyeleven/Device-Trust-Cloud/webhook/internal/testsecret"
 )
 
 func write(t *testing.T, path, content string, mtime time.Time) {
@@ -18,7 +20,13 @@ func write(t *testing.T, path, content string, mtime time.Time) {
 	}
 }
 
-const sample = "\xef\xbb\xbf# inventory\nalice-mbp, c02abc123xyz ,Alice's laptop, with a comma\nwin-01,5CG1234ABC\n\n"
+// Synthetic devices, generated per test run; see the testsecret package.
+var (
+	sampleHost   = testsecret.Hostname()
+	sampleSerial = testsecret.Serial()
+	sample       = "\xef\xbb\xbf# inventory\n" + strings.ToLower(sampleHost) + ", " + strings.ToLower(sampleSerial) +
+		" ,Test laptop, with a comma\n" + testsecret.Hostname() + "," + testsecret.Serial() + "\n\n"
+)
 
 func TestLookup(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "devices.csv")
@@ -31,15 +39,15 @@ func TestLookup(t *testing.T) {
 		t.Errorf("Len = %d, want 2", l.Len())
 	}
 
-	d, ok, err := l.Lookup(" Alice-MBP\r\n")
+	d, ok, err := l.Lookup(" " + strings.ToLower(sampleHost) + "\r\n")
 	if err != nil || !ok {
 		t.Fatalf("Lookup = %+v, %v, %v", d, ok, err)
 	}
-	want := Device{Hostname: "ALICE-MBP", Serial: "C02ABC123XYZ", Note: "Alice's laptop, with a comma"}
+	want := Device{Hostname: sampleHost, Serial: sampleSerial, Note: "Test laptop, with a comma"}
 	if d != want {
 		t.Errorf("device = %+v, want %+v", d, want)
 	}
-	for _, id := range []string{"C02ABC123XYZ", "nope", "", "bad\x01"} { // a serial is not a hostname
+	for _, id := range []string{sampleSerial, "nope", "", "bad\x01"} { // a serial is not a hostname
 		if _, ok, err := l.Lookup(id); ok || err != nil {
 			t.Errorf("Lookup(%q) = %v, %v; want not found", id, ok, err)
 		}

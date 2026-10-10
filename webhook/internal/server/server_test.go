@@ -3,8 +3,13 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/hex"
@@ -22,22 +27,97 @@ import (
 	"github.com/sleventyeleven/Device-Trust-Cloud/webhook/internal/allowlist"
 	"github.com/sleventyeleven/Device-Trust-Cloud/webhook/internal/challenge"
 	"github.com/sleventyeleven/Device-Trust-Cloud/webhook/internal/store"
+	"github.com/sleventyeleven/Device-Trust-Cloud/webhook/internal/testsecret"
+)
+
+// Secrets are generated per test run (see the testsecret package), never
+// written into the source. The signing secrets have the form step-ca prints.
+var (
+	phrase       = testsecret.Phrase()
+	enrollSecret = testsecret.Signing()
+	renewSecret  = testsecret.Signing()
 )
 
 const (
-	phrase = "Queen-Ate-Lamp-Wise-Smell"
-	// Signing secrets as step-ca prints them: base64 of random bytes.
-	enrollSecret = "c2lnbmluZy1zZWNyZXQtZm9yLXRlc3RzLW9ubHk="
-	renewSecret  = "cmVuZXctc2lnbmluZy1zZWNyZXQtZm9yLXRlc3Rz"
-
 	enrollProv = "device-enroll"
 	renewProv  = "device-renew"
-
-	// Hostname (CN and SAN) in testdata/step_ca_scep_request.json; the CSR carries
-	// no serial number, the allowlist maps the hostname to this one.
-	fixtureHost   = "CORSAIRAI"
-	fixtureSerial = "ABC123XYZ"
 )
+
+// The device the request fixture describes. Generated per test run like the
+// secrets; the allowlist maps the hostname to the serial number, and the CSR
+// carries the hostname as its CN and SAN.
+var (
+	fixtureHost   = testsecret.Hostname()
+	fixtureSerial = testsecret.Serial()
+	otherHost     = testsecret.Hostname() // a second, unrelated allowlisted device
+	otherSerial   = testsecret.Serial()
+	strangerHost  = testsecret.Hostname() // not on the allowlist
+	fixtureJSON   = buildFixture()
+)
+
+// buildFixture makes the JSON body step-ca's SCEPCHALLENGE webhook sends, around
+// a real CSR for the fixture device (the field layout is step-ca 0.30's, which
+// the server's own request type decodes; the deployment tests run it against a
+// real step-ca).
+func buildFixture() []byte {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject: pkix.Name{
+			Country: []string{"US"}, Organization: []string{"DeviceTrust"}, OrganizationalUnit: []string{"DeviceTrust"},
+			SerialNumber: fixtureSerial, CommonName: fixtureHost,
+		},
+		DNSNames: []string{fixtureHost},
+	}, key)
+	if err != nil {
+		panic(err)
+	}
+	csr, err := x509.ParseCertificateRequest(der)
+	if err != nil {
+		panic(err)
+	}
+	var san []byte
+	for _, ext := range csr.Extensions {
+		if ext.Id.Equal(asn1.ObjectIdentifier{2, 5, 29, 17}) {
+			san = ext.Value
+		}
+	}
+	enc := base64.StdEncoding.EncodeToString
+	out, err := json.Marshal(map[string]any{
+		"timestamp":       "2026-10-09T12:00:00Z",
+		"provisionerName": enrollProv,
+		"x509CertificateRequest": map[string]any{
+			"version": 0,
+			"subject": map[string]any{
+				"country": []string{"US"}, "organization": []string{"DeviceTrust"}, "organizationalUnit": []string{"DeviceTrust"},
+				"serialNumber": fixtureSerial, "commonName": fixtureHost,
+			},
+			"rawSubject":         enc(csr.RawSubject),
+			"dnsNames":           []string{fixtureHost},
+			"emailAddresses":     nil,
+			"ipAddresses":        nil,
+			"uris":               nil,
+			"sans":               nil,
+			"extensions":         []map[string]any{{"id": "2.5.29.17", "critical": false, "value": enc(san)}},
+			"keyUsage":           nil,
+			"extKeyUsage":        []any{},
+			"unknownExtKeyUsage": nil,
+			"basicConstraints":   nil,
+			"signatureAlgorithm": "",
+			"publicKey":          enc(csr.RawSubjectPublicKeyInfo),
+			"publicKeyAlgorithm": "ECDSA",
+			"raw":                enc(csr.Raw),
+		},
+		"scepChallenge":     "placeholder",
+		"scepTransactionID": "txn-0001",
+	})
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
 
 var now = time.Date(2026, 10, 9, 12, 0, 30, 0, time.UTC)
 
@@ -66,7 +146,7 @@ func newEnv(t *testing.T, mod func(*Config)) *env {
 		t.Fatal(err)
 	}
 	devices := filepath.Join(dir, "devices.csv")
-	if err := os.WriteFile(devices, []byte("# fleet\n"+fixtureHost+","+fixtureSerial+",fixture\nOTHERHOST,OTHER1\n"), 0o600); err != nil {
+	if err := os.WriteFile(devices, []byte("# fleet\n"+fixtureHost+","+fixtureSerial+",fixture\n"+otherHost+","+otherSerial+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	l, err := allowlist.Load(devices)
@@ -91,12 +171,8 @@ func newEnv(t *testing.T, mod func(*Config)) *env {
 		t.Fatal(err)
 	}
 
-	raw, err := os.ReadFile(filepath.Join("..", "..", "testdata", "step_ca_scep_request.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	var body map[string]any
-	if err := json.Unmarshal(raw, &body); err != nil {
+	if err := json.Unmarshal(fixtureJSON, &body); err != nil {
 		t.Fatal(err)
 	}
 	e := &env{h: h, store: st, body: body, secret: enrollSecret}
@@ -222,7 +298,7 @@ func TestFixtureIsWhatWeThink(t *testing.T) {
 func TestEnrollAllowsChallengeDerivedFromTheMappedSerial(t *testing.T) {
 	e := newEnv(t, nil)
 	e.setChallenge(t, phrase, strings.ToLower(fixtureSerial)) // script did not upper-case
-	e.setCN("corsairai")
+	e.setCN(strings.ToLower(fixtureHost))
 	wantAllow(t, e.do(t), true)
 
 	pin, ok, _ := e.store.PinFor(context.Background(), fixtureHost)
@@ -238,11 +314,11 @@ func TestEnrollDenies(t *testing.T) {
 	}{
 		{"the static challenge from the fixture", func(t *testing.T, e *env) {}},
 		{"empty challenge", func(t *testing.T, e *env) { e.body["scepChallenge"] = "" }},
-		{"wrong phrase", func(t *testing.T, e *env) { e.setChallenge(t, "Queen-Ate-Lamp-Wise-Smelt", fixtureSerial) }},
-		{"challenge computed from another host's serial", func(t *testing.T, e *env) { e.setChallenge(t, phrase, "OTHER1") }},
+		{"wrong phrase", func(t *testing.T, e *env) { e.setChallenge(t, phrase+"x", fixtureSerial) }},
+		{"challenge computed from another host's serial", func(t *testing.T, e *env) { e.setChallenge(t, phrase, otherSerial) }},
 		{"challenge computed from the hostname instead of the serial", func(t *testing.T, e *env) { e.setChallenge(t, phrase, fixtureHost) }},
 		{"hostname not on the allowlist", func(t *testing.T, e *env) {
-			e.setHost("STRANGER")
+			e.setHost(strangerHost)
 			e.setChallenge(t, phrase, fixtureSerial)
 		}},
 		{"phrase revoked", func(t *testing.T, e *env) {
@@ -293,16 +369,18 @@ func TestSANsMustBeTheHostname(t *testing.T) {
 		want  bool
 	}{
 		{"no SAN extension", func(e *env) { e.setSANs() }, true},
-		{"SAN equals hostname", func(e *env) { e.setSANs(san2("corsairai")) }, true},
-		{"SAN is an FQDN of the host", func(e *env) { e.setSANs(sanDER(gn{2, "corsairai"}, gn{2, "corsairai.corp.example.com"})) }, true},
-		{"CN empty, SAN gives the hostname", func(e *env) { e.setCN(""); e.setSANs(san2("CORSAIRAI")) }, true},
-		{"SAN names another host", func(e *env) { e.setSANs(sanDER(gn{2, "CORSAIRAI"}, gn{2, "OTHERHOST"})) }, false},
-		{"SAN only looks like a subdomain", func(e *env) { e.setSANs(san2("CORSAIRAI-evil.example.com")) }, false},
-		{"SAN with an email", func(e *env) { e.setSANs(sanDER(gn{2, "CORSAIRAI"}, gn{1, "ceo@example.com"})) }, false},
-		{"SAN with an IP", func(e *env) { e.setSANs(sanDER(gn{2, "CORSAIRAI"}, gn{7, "\x0a\x00\x00\x01"})) }, false},
-		{"two SAN extensions", func(e *env) { e.setSANs(san2("CORSAIRAI"), san2("OTHERHOST")) }, false},
+		{"SAN equals hostname", func(e *env) { e.setSANs(san2(strings.ToLower(fixtureHost))) }, true},
+		{"SAN is an FQDN of the host", func(e *env) {
+			e.setSANs(sanDER(gn{2, strings.ToLower(fixtureHost)}, gn{2, strings.ToLower(fixtureHost) + ".corp.example.com"}))
+		}, true},
+		{"CN empty, SAN gives the hostname", func(e *env) { e.setCN(""); e.setSANs(san2(fixtureHost)) }, true},
+		{"SAN names another host", func(e *env) { e.setSANs(sanDER(gn{2, fixtureHost}, gn{2, otherHost})) }, false},
+		{"SAN only looks like a subdomain", func(e *env) { e.setSANs(san2(fixtureHost + "-evil.example.com")) }, false},
+		{"SAN with an email", func(e *env) { e.setSANs(sanDER(gn{2, fixtureHost}, gn{1, "ceo@example.com"})) }, false},
+		{"SAN with an IP", func(e *env) { e.setSANs(sanDER(gn{2, fixtureHost}, gn{7, "\x0a\x00\x00\x01"})) }, false},
+		{"two SAN extensions", func(e *env) { e.setSANs(san2(fixtureHost), san2(otherHost)) }, false},
 		{"garbage SAN extension", func(e *env) { e.setSANs([]byte("not asn1")) }, false},
-		{"trailing bytes after the SAN", func(e *env) { e.setSANs(append(san2("CORSAIRAI"), 0)) }, false},
+		{"trailing bytes after the SAN", func(e *env) { e.setSANs(append(san2(fixtureHost), 0)) }, false},
 	}
 	for _, tc := range cases {
 		t.Run("enroll/"+tc.name, func(t *testing.T) {
@@ -341,8 +419,8 @@ func TestEnrollIsSingleUse(t *testing.T) {
 	wantAllow(t, e.do(t), false) // a second enrollment with the same phrase
 
 	// Another host can still use the same phrase.
-	e.setHost("OTHERHOST")
-	e.setChallenge(t, phrase, "OTHER1")
+	e.setHost(otherHost)
+	e.setChallenge(t, phrase, otherSerial)
 	wantAllow(t, e.do(t), true)
 
 	// A new phrase lets the first host enroll again, with a new key.
@@ -399,11 +477,11 @@ func TestRenewDenies(t *testing.T) {
 	})
 	t.Run("another host's key", func(t *testing.T) {
 		e := enrolled(t, nil)
-		// OTHERHOST enrolls with keyB, then tries to renew as CORSAIRAI with it.
+		// The other host enrolls with keyB, then tries to renew as the fixture host with it.
 		e.asEnroll()
-		e.setHost("OTHERHOST")
+		e.setHost(otherHost)
 		e.setKey(keyB)
-		e.setChallenge(t, phrase, "OTHER1")
+		e.setChallenge(t, phrase, otherSerial)
 		wantAllow(t, e.do(t), true)
 		e.asRenew()
 		e.setHost(fixtureHost)
@@ -421,7 +499,7 @@ func TestRenewDenies(t *testing.T) {
 		e.asRenew()
 		wantAllow(t, e.do(t), true)
 
-		os.WriteFile(path, []byte("OTHERHOST,OTHER1\n"), 0o600) // decommissioned
+		os.WriteFile(path, []byte(otherHost+","+otherSerial+"\n"), 0o600) // decommissioned
 		os.Chtimes(path, now.Add(time.Hour), now.Add(time.Hour))
 		wantAllow(t, e.do(t), false)
 	})
@@ -487,7 +565,7 @@ func TestSignature(t *testing.T) {
 		"missing signature":             {b, "", http.StatusUnauthorized},
 		"non-hex signature":             {b, "zz", http.StatusUnauthorized},
 		"signature of other body":       {b, sign(enrollSecret, []byte("{}")), http.StatusUnauthorized},
-		"tampered body":                 {bytes.Replace(b, []byte(fixtureHost), []byte("OTHERHOST"), 1), sign(enrollSecret, b), http.StatusUnauthorized},
+		"tampered body":                 {bytes.Replace(b, []byte(fixtureHost), []byte(otherHost), 1), sign(enrollSecret, b), http.StatusUnauthorized},
 		"signed garbage":                {[]byte("not json"), sign(enrollSecret, []byte("not json")), http.StatusBadRequest},
 		"oversized":                     {bytes.Repeat([]byte("a"), maxBody+10), sign(enrollSecret, b), http.StatusBadRequest},
 	} {

@@ -19,8 +19,8 @@
 //
 // step-ca signs each call with an HMAC-SHA256 of the body (hex, in
 // X-Smallstep-Signature) keyed with the webhook's signing secret, and expects
-// {"allow": true|false} in reply. testdata/step_ca_scep_request.json is a
-// request produced by step-ca's own types.
+// {"allow": true|false} in reply. The tests build a request in step-ca's layout
+// around a generated CSR.
 package server
 
 import (

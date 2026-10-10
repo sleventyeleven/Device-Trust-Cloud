@@ -6,9 +6,12 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/sleventyeleven/Device-Trust-Cloud/webhook/internal/testsecret"
 )
 
-const phrase = "Queen-Ate-Lamp-Wise-Smell"
+// Generated per test run; see the testsecret package.
+var phrase = testsecret.Phrase()
 
 var t0 = time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
 

@@ -257,4 +257,4 @@ go test ./...
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o device-trust-webhook .
 ```
 
-`testdata/step_ca_scep_request.json` is a real request generated with step-ca's own types, and the tests run against it.
+The tests generate every secret, the device identity and a request in step-ca's layout (around a freshly made CSR) when they start, so nothing secret-shaped or captured from a real machine is checked in. The layout itself is exercised against a real step-ca in the deployment tests.

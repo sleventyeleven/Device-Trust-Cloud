@@ -11,6 +11,14 @@ import (
 	"time"
 
 	"github.com/sleventyeleven/Device-Trust-Cloud/webhook/internal/store"
+	"github.com/sleventyeleven/Device-Trust-Cloud/webhook/internal/testsecret"
+)
+
+// Generated per test run; see the testsecret package.
+var (
+	cliPhrase = testsecret.Phrase()
+	cliSerial = testsecret.Serial()
+	cliHost   = testsecret.Hostname()
 )
 
 type result struct {
@@ -32,7 +40,7 @@ func runCLI(t *testing.T, stdin string, environ map[string]string, args ...strin
 
 func TestPhraseCommands(t *testing.T) {
 	dir := t.TempDir()
-	environ := map[string]string{"DTW_DB": filepath.Join(dir, "cli.db"), "DTW_PHRASE": "Queen-Ate-Lamp-Wise-Smell"}
+	environ := map[string]string{"DTW_DB": filepath.Join(dir, "cli.db"), "DTW_PHRASE": cliPhrase}
 
 	var wl strings.Builder
 	for i := 0; i < 300; i++ {
@@ -84,7 +92,7 @@ func TestPhraseCommands(t *testing.T) {
 	})
 	t.Run("list never shows phrases", func(t *testing.T) {
 		r := runCLI(t, "", environ, "phrase", "list")
-		if r.code != 0 || !strings.Contains(r.out, "active") || strings.Contains(r.out, "Queen") {
+		if r.code != 0 || !strings.Contains(r.out, "active") || strings.Contains(r.out, cliPhrase) {
 			t.Errorf("%+v", r)
 		}
 	})
@@ -114,43 +122,43 @@ func TestUses(t *testing.T) {
 	}
 	ctx, now := context.Background(), time.Now()
 	id, _ := st.AddPhrase(ctx, "a-b-c-d-e", now, now.Add(time.Hour))
-	st.Enroll(ctx, id, "ABC123", "txn-1", []byte("pinned-key"), now)
+	st.Enroll(ctx, id, cliHost, "txn-1", []byte("pinned-key"), now)
 	st.Close()
 
-	if r := runCLI(t, "", environ, "uses", "list"); r.code != 0 || !strings.Contains(r.out, "ABC123") || !strings.Contains(r.out, "txn-1") {
+	if r := runCLI(t, "", environ, "uses", "list"); r.code != 0 || !strings.Contains(r.out, cliHost) || !strings.Contains(r.out, "txn-1") {
 		t.Errorf("list: %+v", r)
 	}
 	if r := runCLI(t, "", environ, "phrase", "list"); !strings.Contains(r.out, "1\n") {
 		t.Errorf("phrase list should show one device used: %+v", r)
 	}
-	if r := runCLI(t, "", environ, "uses", "reset", "abc123"); r.code != 0 || !strings.Contains(r.out, "cleared 1 use(s) for ABC123") {
+	if r := runCLI(t, "", environ, "uses", "reset", strings.ToLower(cliHost)); r.code != 0 || !strings.Contains(r.out, "cleared 1 use(s) for "+cliHost) {
 		t.Errorf("reset: %+v", r)
 	}
-	if r := runCLI(t, "", environ, "uses", "list"); strings.Contains(r.out, "ABC123") {
+	if r := runCLI(t, "", environ, "uses", "list"); strings.Contains(r.out, cliHost) {
 		t.Errorf("use still listed after reset: %+v", r)
 	}
 
-	if r := runCLI(t, "", environ, "pins", "list"); r.code != 0 || !strings.Contains(r.out, "ABC123") || strings.Contains(r.out, "pinned-key") {
+	if r := runCLI(t, "", environ, "pins", "list"); r.code != 0 || !strings.Contains(r.out, cliHost) || strings.Contains(r.out, "pinned-key") {
 		t.Errorf("pins list should show the host and a fingerprint, never the key: %+v", r)
 	}
-	if r := runCLI(t, "", environ, "pins", "clear", "abc123"); r.code != 0 || !strings.Contains(r.out, "ABC123") {
+	if r := runCLI(t, "", environ, "pins", "clear", strings.ToLower(cliHost)); r.code != 0 || !strings.Contains(r.out, cliHost) {
 		t.Errorf("pins clear: %+v", r)
 	}
-	if r := runCLI(t, "", environ, "pins", "clear", "abc123"); r.code != 1 || !strings.Contains(r.errOut, "no pinned key") {
+	if r := runCLI(t, "", environ, "pins", "clear", strings.ToLower(cliHost)); r.code != 1 || !strings.Contains(r.errOut, "no pinned key") {
 		t.Errorf("pins clear (again): %+v", r)
 	}
-	if r := runCLI(t, "", environ, "pins", "list"); strings.Contains(r.out, "ABC123") {
+	if r := runCLI(t, "", environ, "pins", "list"); strings.Contains(r.out, cliHost) {
 		t.Errorf("pin still listed after clear: %+v", r)
 	}
 }
 
 func TestChallenge(t *testing.T) {
-	const want = "6ZR262r4trPJ6vKSEOgBATU4m8NXj97z0oOmBt/wo8c="
-	env := map[string]string{"DTW_PHRASE": "Queen-Ate-Lamp-Wise-Smell"}
-	if r := runCLI(t, "", env, "challenge", "c02abc123xyz"); r.code != 0 || strings.TrimSpace(r.out) != want {
+	want := testsecret.Challenge(cliPhrase, cliSerial)
+	env := map[string]string{"DTW_PHRASE": cliPhrase}
+	if r := runCLI(t, "", env, "challenge", strings.ToLower(cliSerial)); r.code != 0 || strings.TrimSpace(r.out) != want {
 		t.Errorf("env phrase: %+v", r)
 	}
-	if r := runCLI(t, "Queen-Ate-Lamp-Wise-Smell\n", nil, "challenge", "-phrase-file", "-", "C02ABC123XYZ"); r.code != 0 || strings.TrimSpace(r.out) != want {
+	if r := runCLI(t, cliPhrase+"\n", nil, "challenge", "-phrase-file", "-", cliSerial); r.code != 0 || strings.TrimSpace(r.out) != want {
 		t.Errorf("stdin phrase: %+v", r)
 	}
 	if r := runCLI(t, "", nil, "challenge", "ABC"); r.code == 0 || !strings.Contains(r.errOut, "phrase") {
