@@ -64,6 +64,10 @@ module "root_ca" {
   lifetime             = var.root_ca_lifetime
   root_ca_gcs_bucket   = var.root_ca_gcs_bucket
   location             = var.location
+
+  deletion_protection                    = var.ca_deletion_protection
+  skip_grace_period                      = var.ca_skip_grace_period
+  ignore_active_certificates_on_deletion = var.ca_ignore_active_certificates_on_deletion
 }
 
 # Import the intermediate CA module
@@ -79,6 +83,20 @@ module "intermediate_ca" {
   key_algorithm           = var.intermediate_ca_key_algorithm
   lifetime                = var.intermediate_ca_lifetime
   location                = var.location
+
+  deletion_protection                    = var.ca_deletion_protection
+  skip_grace_period                      = var.ca_skip_grace_period
+  ignore_active_certificates_on_deletion = var.ca_ignore_active_certificates_on_deletion
+}
+
+# Certificate issuance can return 404 for a few seconds after a CA is created
+# (the first apply of a fresh environment failed on exactly this, and a re-run
+# succeeded). Everything that issues a certificate from the intermediate CA
+# waits for this pause instead.
+resource "time_sleep" "ca_propagation" {
+  depends_on = [module.intermediate_ca]
+
+  create_duration = "60s"
 }
 
 # Import the certificate template module
@@ -99,7 +117,7 @@ module "certificate_template" {
 module "stepca" {
   source = "./modules/stepca_container"
 
-  depends_on = [google_project_service.apis]
+  depends_on = [google_project_service.apis, time_sleep.ca_propagation]
 
   service_account_name         = var.service_account_name
   service_account_display_name = var.service_account_display_name
@@ -118,6 +136,13 @@ module "stepca" {
   intermediate_ca_name        = var.intermediate_ca_name
   intermediate_ca_resource_id = module.intermediate_ca.intermediate_ca_id
   ca_pool_iam_binding_ids     = module.ca_pool.ca_pool_iam_binding_ids
+
+  enable_webhook             = var.enable_webhook
+  webhook_binary_path        = var.webhook_binary_path
+  webhook_enroll_provisioner = var.webhook_enroll_provisioner
+  webhook_renew_provisioner  = var.webhook_renew_provisioner
+  webhook_devices            = var.webhook_devices
+  scep_cert_lifetime         = var.scep_cert_lifetime
 }
 
 # Import the SCEP gateway module: path-restricted LB in front of the
@@ -125,7 +150,7 @@ module "stepca" {
 module "scep_gateway" {
   source = "./modules/scep_gateway"
 
-  depends_on = [google_project_service.apis]
+  depends_on = [google_project_service.apis, time_sleep.ca_propagation]
 
   scep_gateway_name        = var.scep_gateway_name
   stepca_instance_group_id = module.stepca.instance_group_id
@@ -144,7 +169,7 @@ module "mtls_test_gateway" {
   source = "./modules/mtls_test_gateway"
   count  = var.enable_mtls_test_gateway ? 1 : 0
 
-  depends_on = [google_project_service.apis]
+  depends_on = [google_project_service.apis, time_sleep.ca_propagation]
 
   project_id                      = var.project_id
   mtls_gateway_name               = var.mtls_gateway_name

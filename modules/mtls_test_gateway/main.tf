@@ -164,7 +164,9 @@ resource "google_compute_instance" "mtls_gateway" {
     nginx-conf                = local.nginx_conf
     server-key-secret-version = google_secret_manager_secret_version.server_key.name
 
-    startup-script = <<-EOT
+    # HCL keeps carriage returns, so a CRLF checkout (git autocrlf on Windows)
+    # would leave "#!/bin/bash\r" and the script would not run. Strip them.
+    startup-script = replace(<<-EOT
       #!/bin/bash
       set -e
 
@@ -200,6 +202,7 @@ resource "google_compute_instance" "mtls_gateway" {
         -v /etc/nginx-test/conf.d:/etc/nginx/conf.d:ro \
         nginx:latest
     EOT
+    , "\r", "")
   }
 
   depends_on = [

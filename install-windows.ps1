@@ -13,9 +13,11 @@ param(
     [string]$RootCaFile = $env:ROOT_CA_FILE,
     [string]$IntermediateCaUrl = $env:INTERMEDIATE_CA_URL,
     [string]$IntermediateCaFile = $env:INTERMEDIATE_CA_FILE_SRC,
-    [string]$Country = $env:CERT_COUNTRY,
-    [string]$Organization = $env:CERT_ORGANIZATION,
-    [string]$Ou = $env:CERT_OU,
+    # Subject fields of the certificate. Defaults match install-macos.sh; scepclient
+    # fails ("flag needs an argument") if one is passed empty.
+    [string]$Country = $(if ($env:CERT_COUNTRY) { $env:CERT_COUNTRY } else { "US" }),
+    [string]$Organization = $(if ($env:CERT_ORGANIZATION) { $env:CERT_ORGANIZATION } else { "DeviceTrust" }),
+    [string]$Ou = $(if ($env:CERT_OU) { $env:CERT_OU } else { "DeviceTrust" }),
     # Delete: remove the loose private key after import (default - matches
     #   "non-exportable" most literally, but forces a full re-enrollment
     #   (new key, new cert, new CA-signing operation) on every renewal.
@@ -24,7 +26,25 @@ param(
     #   security/cost trade-off between these.
     [ValidateSet("Delete", "RestrictPermissions")]
     [string]$KeyProtection = $(if ($env:KEY_PROTECTION) { $env:KEY_PROTECTION } else { "Delete" }),
-    [string]$MtlsGatewayUrl = $env:MTLS_GATEWAY_URL
+    [string]$MtlsGatewayUrl = $env:MTLS_GATEWAY_URL,
+    # Per-device SCEP challenges (optional, needs the webhook in
+    # webhook/README.md; leave these unset and this script behaves exactly as
+    # it always has, sending the single static -Challenge to -Provisioner):
+    #   -ScepPhrase        The current enrollment phrase. The challenge sent is
+    #                      then computed from this PC's serial number:
+    #                      base64(HMAC-SHA256(phrase, "device-trust-scep-challenge-v1`n" + SERIAL)).
+    #   -RenewProvisioner  The renewal provisioner (device-trust-scep-renew with
+    #                      the Terraform webhook). When set and the key from the
+    #                      last run is still on disk (-KeyProtection
+    #                      RestrictPermissions), the run renews with that same
+    #                      key and needs no phrase.
+    #   -ScepAttempts      How often a failed scepclient call is tried (default
+    #                      3). scepclient occasionally fails on its own signature
+    #                      before the request reaches step-ca; a retry works and
+    #                      retrying a refused request is harmless.
+    [string]$ScepPhrase = $env:SCEP_PHRASE,
+    [string]$RenewProvisioner = $env:SCEP_RENEW_PROVISIONER,
+    [int]$ScepAttempts = $(if ($env:SCEP_ATTEMPTS) { [int]$env:SCEP_ATTEMPTS } else { 3 })
 )
 
 # Check for Administrator privileges
@@ -69,6 +89,9 @@ $Hostname = [System.Net.Dns]::GetHostName()
 # (see Readme.md for the cost/security trade-off).
 $ExistingCert = Get-ChildItem -Path Cert:\CurrentUser\My | Where-Object { $_.FriendlyName -eq $CertFriendlyName } | Select-Object -First 1
 $IsRenewal = $null -ne $ExistingCert
+# Is the key from the last run still on disk? Only then can this run reuse it
+# (-KeyProtection Delete removes it, so every run starts a new key).
+$HaveKey = (Test-Path -Path $PrivateKeyFile) -and (Test-Path -Path $CertFile)
 
 # Create directories
 if (-not (Test-Path -Path $InstallDir)) {
@@ -82,8 +105,10 @@ if (-not (Test-Path -Path $CertDir)) {
 Write-Host "Device Trust Certificate Installation" -ForegroundColor Cyan
 Write-Host "====================================" -ForegroundColor Cyan
 Write-Host ""
-if ($IsRenewal) {
-    Write-Host "Existing device certificate found in Cert:\CurrentUser\My - this run will renew it." -ForegroundColor Yellow
+if ($HaveKey) {
+    Write-Host "Existing device certificate and key found - this run will renew it (same key)." -ForegroundColor Yellow
+} elseif ($IsRenewal) {
+    Write-Host "Existing device certificate found in Cert:\CurrentUser\My but no key to reuse - this run enrolls with a new key." -ForegroundColor Yellow
 } else {
     Write-Host "No existing device certificate found - this is a first-time enrollment." -ForegroundColor Yellow
 }
@@ -91,6 +116,7 @@ Write-Host ""
 Write-Host "Configuration:"
 Write-Host "- SCEP Server: $ScepServerUrl"
 Write-Host "- Provisioner: $Provisioner"
+if ($RenewProvisioner) { Write-Host "- Renewal provisioner: $RenewProvisioner" }
 Write-Host "- Hostname: $Hostname"
 Write-Host "- Key protection: $KeyProtection"
 Write-Host "- Cert Directory: $CertDir"
@@ -262,37 +288,122 @@ Write-Host ""
 
 # Build scepclient command
 $ScepTool = "$InstallDir\scepclient.exe"
-$ServerUrl = "$ScepServerUrl/scep/$Provisioner"
 $DnsName = $Hostname
 $CommonName = $Hostname
 
+# This PC's serial number, as the server's allowlist records it: trimmed and
+# upper-cased. DEVICE_SERIAL overrides the hardware lookup (virtual machines
+# and test rigs that report a placeholder serial).
+function Get-DeviceSerial {
+    if ($env:DEVICE_SERIAL) { return $env:DEVICE_SERIAL }
+    (Get-CimInstance Win32_BIOS).SerialNumber
+}
+function Get-NormalizedSerial { (Get-DeviceSerial).Trim().ToUpperInvariant() }
+function Get-PhraseChallenge {
+    $serial = Get-NormalizedSerial
+    if (-not $serial) { throw "Could not read this PC's serial number to build the per-device challenge" }
+    $h = New-Object System.Security.Cryptography.HMACSHA256
+    try {
+        $h.Key = [Text.Encoding]::UTF8.GetBytes($ScepPhrase)
+        $msg = [Text.Encoding]::UTF8.GetBytes("device-trust-scep-challenge-v1`n$serial")
+        [Convert]::ToBase64String($h.ComputeHash($msg))
+    } finally { $h.Dispose() }
+}
+
+# One scepclient request, retried up to -ScepAttempts times (see the parameter
+# comment). Returns $true on success. Out-Host keeps scepclient's output out of
+# the return value.
+# usage: Invoke-ScepRequest <key-file> <cert-file> <provisioner> <challenge>
+function Invoke-ScepRequest([string]$KeyFile, [string]$CertOut, [string]$ForProvisioner, [string]$ForChallenge) {
+    for ($attempt = 1; $attempt -le $ScepAttempts; $attempt++) {
+        $KeyDir = Split-Path -Parent $KeyFile
+        Remove-Item -Path (Join-Path $KeyDir "csr.pem") -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -Path $KeyFile)) { Remove-Item -Path (Join-Path $KeyDir "self.pem") -Force -ErrorAction SilentlyContinue }
+        & $ScepTool -private-key $KeyFile -certificate $CertOut -server-url "$ScepServerUrl/scep/$ForProvisioner" -challenge $ForChallenge -dnsname $DnsName -cn $CommonName -country $Country -organization $Organization -ou $Ou | Out-Host
+        if ($LASTEXITCODE -eq 0) { return $true }
+        if ($attempt -lt $ScepAttempts) {
+            Write-Warning "scepclient attempt $attempt of $ScepAttempts failed - retrying in 2 seconds"
+            Start-Sleep -Seconds 2
+        }
+    }
+    return $false
+}
+
+# Renew with the key from the last run when we can (webhook mode); otherwise
+# enroll. Without -ScepPhrase and -RenewProvisioner this is the original
+# behaviour: one provisioner, the static challenge.
+$Action = "enroll"
+$ActiveProvisioner = $Provisioner
+$ActiveChallenge = $Challenge
+$ChallengeNote = "static SCEP_CHALLENGE (per-device challenges are not in use)"
+if ($RenewProvisioner -and $HaveKey) {
+    $Action = "renew"
+    $ActiveProvisioner = $RenewProvisioner
+    $ActiveChallenge = "not-used-for-renewal"      # the renewal path ignores it
+    $ChallengeNote = "renewal with the key from the last run; no phrase or challenge is sent, the server checks the key against the one pinned at enrollment"
+} elseif ($ScepPhrase) {
+    $ActiveChallenge = Get-PhraseChallenge
+    $ChallengeNote = "per-device challenge from this PC's serial number $(Get-NormalizedSerial) (HMAC-SHA256 keyed by the phrase; the phrase and the challenge are not shown)"
+}
+
+Write-Host "Action: $Action via provisioner $ActiveProvisioner (the challenge itself is not printed)" -ForegroundColor Cyan
+Write-Host "Challenge: $ChallengeNote" -ForegroundColor Cyan
 Write-Host "Command:" -ForegroundColor Cyan
-Write-Host "$ScepTool -private-key `"$PrivateKeyFile`" -certificate `"$CertFile`" -server-url `"$ServerUrl`" -challenge `"$Challenge`" -dnsname `"$DnsName`" -cn `"$CommonName`" -country `"$Country`" -organization `"$Organization`" -ou `"$Ou`"" -NoNewline
+Write-Host "$ScepTool -private-key `"$PrivateKeyFile`" -certificate `"$CertFile`" -server-url `"$ScepServerUrl/scep/$ActiveProvisioner`" -challenge <redacted> -dnsname `"$DnsName`" -cn `"$CommonName`" -country `"$Country`" -organization `"$Organization`" -ou `"$Ou`"" -NoNewline
 Write-Host ""
 
-# If there's no private key for scepclient to reuse, it's about to generate
-# a brand-new one - so any cached csr.pem from a previous run (e.g. one that
-# didn't complete far enough to reach the KeyProtection cleanup below) is
-# now stale and would otherwise get silently resubmitted, producing a
-# certificate that doesn't match the new key. See $CsrCacheFile above.
-if (-not (Test-Path -Path $PrivateKeyFile) -and (Test-Path -Path $CsrCacheFile)) {
-    Remove-Item -Path $CsrCacheFile -Force
-}
+# scepclient caches its CSR - challenge included - next to the key and silently
+# resends it, ignoring a new -challenge. Invoke-ScepRequest therefore clears it
+# before every request.
+# scepclient also keeps a self-signed signer certificate (self.pem) next to the
+# key and signs every request with it; a new key signed against an old self.pem
+# fails with "crypto/rsa: verification error", so it goes whenever the key does.
+# Remember whether a key existed, so a failed first
+# enrollment can remove the key it just made instead of leaving it behind.
+$KeyBeforeRun = Test-Path -Path $PrivateKeyFile
 
 # Execute scepclient. (No file-based backup/restore needed here anymore - the
 # old certificate store entry, if any, isn't touched until the new one has
 # been imported successfully further down.)
-& $ScepTool -private-key $PrivateKeyFile -certificate $CertFile -server-url $ServerUrl -challenge $Challenge -dnsname $DnsName -cn $CommonName -country $Country -organization $Organization -ou $Ou
+$ScepOk = Invoke-ScepRequest $PrivateKeyFile $CertFile $ActiveProvisioner $ActiveChallenge
 
-if ($LASTEXITCODE -ne 0) {
+# A refused renewal (for example an administrator cleared this PC's pin, or the
+# PC was replaced) falls back to enrolling with a brand-new key, if a phrase is
+# available. It runs in a scratch directory so the current key and certificate
+# stay untouched until the new ones have actually been issued.
+if (-not $ScepOk -and $Action -eq "renew" -and $ScepPhrase) {
+    Write-Warning "Renewal was refused - enrolling with a new key and the phrase instead."
+    $Action = "enroll"
+    $ActiveProvisioner = $Provisioner
+    $ChallengeNote = "per-device challenge from this PC's serial number $(Get-NormalizedSerial) (fallback after the renewal was refused)"
+    $FallbackDir = Join-Path $CertDir ("enroll-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -Path $FallbackDir -ItemType Directory -Force | Out-Null
+    $FallbackKey = Join-Path $FallbackDir "client.key"
+    $FallbackCert = Join-Path $FallbackDir "client.crt"
+    $ScepOk = Invoke-ScepRequest $FallbackKey $FallbackCert $Provisioner (Get-PhraseChallenge)
+    if ($ScepOk -and (Test-Path -Path $FallbackCert)) {
+        Move-Item -Path $FallbackKey -Destination $PrivateKeyFile -Force
+        Move-Item -Path $FallbackCert -Destination $CertFile -Force
+        Remove-Item -Path $CsrCacheFile -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -Path $FallbackDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+if (-not $ScepOk) {
     Write-Host ""
     Write-Error "Certificate request failed!"
     Write-Error "Please check your SCEP server URL, challenge, and root CA installation."
+    if (-not $KeyBeforeRun) {
+        # The key was made for this attempt and has no certificate: don't leave it.
+        Remove-Item -Path $PrivateKeyFile, $CsrCacheFile, "$CertDir\self.pem" -Force -ErrorAction SilentlyContinue
+    }
     if ($IsRenewal) {
         Write-Warning "The existing certificate in Cert:\CurrentUser\My was not touched."
     }
     exit 1
 }
+
+Write-Host "SCEP server issued the certificate (action: $Action, provisioner: $ActiveProvisioner)" -ForegroundColor Green
 
 # Verify certificate was created
 if (-not (Test-Path -Path $CertFile)) {
@@ -373,6 +484,7 @@ Remove-Item -Path $PfxFile -Force
 
 # Now that the new certificate is confirmed installed, remove the old store
 # entry it superseded (if this was a renewal).
+$SupersededRemoved = $false
 if ($IsRenewal -and $ExistingCert) {
     $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("My", "CurrentUser")
     $store.Open("ReadWrite")
@@ -380,6 +492,7 @@ if ($IsRenewal -and $ExistingCert) {
     if ($stillPresent) {
         $store.Remove($stillPresent)
         Write-Host "Removed the superseded certificate." -ForegroundColor Green
+        $SupersededRemoved = $true
     }
     $store.Close()
 }
@@ -395,6 +508,7 @@ if ($KeyProtection -eq "Delete") {
     # against on the next run (see $CsrCacheFile above), so don't rely
     # solely on that guard catching it later.
     Remove-Item -Path $CsrCacheFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path "$CertDir\self.pem" -Force -ErrorAction SilentlyContinue
     Write-Host "Deleted the loose private key and certificate files. The next renewal will generate a new key (full re-enrollment)." -ForegroundColor Green
 } else {
     # RestrictPermissions: keep the key file in place (so scepclient reuses
@@ -460,6 +574,34 @@ Write-Host "Installation Successful!" -ForegroundColor Green
 Write-Host "====================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "Certificate installed in: Cert:\CurrentUser\My (FriendlyName: $CertFriendlyName)"
+
+# What this run actually did, in terms a person can check.
+function Get-KeyHash($c) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { ([BitConverter]::ToString($sha.ComputeHash($c.PublicKey.EncodedKeyValue.RawData)) -replace '-', '').Substring(0, 16).ToLower() } finally { $sha.Dispose() }
+}
+$NewCert = Get-ChildItem -Path Cert:\CurrentUser\My | Where-Object { $_.FriendlyName -eq $CertFriendlyName } | Sort-Object NotBefore -Descending | Select-Object -First 1
+if ($NewCert) {
+    $NewKeyHash = Get-KeyHash $NewCert
+    $KeyRelation = if (-not $ExistingCert) { "first certificate on this PC" } elseif ((Get-KeyHash $ExistingCert) -eq $NewKeyHash) { "same key as the certificate it replaced" } else { "new key" }
+    $NextRun = if ($KeyProtection -eq "Delete") { "enrolls again with a new key (needs a current phrase when the webhook is in use)" }
+               elseif ($RenewProvisioner) { "renews through $RenewProvisioner with no phrase" }
+               else { "enrolls again with the same key (set SCEP_RENEW_PROVISIONER to renew without a phrase)" }
+    $KeyState = if ($KeyProtection -eq "Delete") { "non-exportable in the certificate store only; the key files were deleted" }
+                else { "non-exportable in the certificate store; a copy is kept at $PrivateKeyFile, readable only by SYSTEM and Administrators" }
+    $WebhookState = if ($ChallengeNote -like "static*") { "not used (static challenge)" } else { "used: the server accepted this request through the per-device flow" }
+    Write-Host ""
+    Write-Host "What happened" -ForegroundColor Cyan
+    Write-Host "  Request:      $Action through provisioner $ActiveProvisioner"
+    Write-Host "  Challenge:    $ChallengeNote"
+    Write-Host "  Webhook:      $WebhookState"
+    Write-Host "  Device:       $Hostname"
+    Write-Host ("  Certificate:  serial {0}, valid {1:yyyy-MM-dd} to {2:yyyy-MM-dd} ({3} days), names: {4}" -f $NewCert.SerialNumber, $NewCert.NotBefore, $NewCert.NotAfter, [int]($NewCert.NotAfter - $NewCert.NotBefore).TotalDays, ($NewCert.DnsNameList.Unicode -join ", "))
+    Write-Host "  Public key:   sha256 $NewKeyHash ($KeyRelation)"
+    if ($SupersededRemoved) { Write-Host "  Replaced:     the previous certificate ($($ExistingCert.Thumbprint.Substring(0, 12))...) was removed from the store" }
+    Write-Host "  Private key:  $KeyState"
+    Write-Host "  Next run:     $NextRun"
+}
 Write-Host "Full chain (public data): $FullChainFile"
 if ($MtlsTestResult) {
     Write-Host "mTLS gateway test: $MtlsTestResult"

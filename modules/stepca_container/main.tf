@@ -66,6 +66,11 @@ locals {
     scep_challenge        = random_password.scep_challenge.result
     decrypter_cert_b64    = base64encode(google_privateca_certificate.scep_decrypter.pem_certificate)
     decrypter_key_b64     = base64encode(tls_private_key.scep_decrypter.private_key_pem)
+    enroll_provisioner    = var.webhook_enroll_provisioner
+    renew_provisioner     = var.webhook_renew_provisioner
+    webhook_enabled       = var.enable_webhook
+    webhook_url           = local.webhook_url
+    cert_lifetime         = var.scep_cert_lifetime
   })
 }
 
@@ -118,6 +123,164 @@ resource "google_secret_manager_secret_iam_member" "stepca_password_accessor" {
   member    = "serviceAccount:${google_service_account.sa_stepca.email}"
 }
 
+# ---------------------------------------------------------------------------
+# Optional: device-trust-webhook (per-device SCEP challenges), see
+# webhook/README.md. Everything below only exists when enable_webhook is set.
+# ---------------------------------------------------------------------------
+
+locals {
+  # step-ca only calls https webhook URLs. The webhook listens on the Docker
+  # bridge address of the VM, which is how the step-ca container reaches the
+  # host. step-ca trusts our own root and intermediate CAs for webhook servers,
+  # so the webhook's certificate is simply issued from the intermediate CA.
+  webhook_url = "https://172.17.0.1:8081/scep/challenge"
+}
+
+resource "tls_private_key" "webhook" {
+  count     = var.enable_webhook ? 1 : 0
+  algorithm = "RSA"
+  rsa_bits  = 2048
+}
+
+resource "tls_cert_request" "webhook" {
+  count           = var.enable_webhook ? 1 : 0
+  private_key_pem = tls_private_key.webhook[0].private_key_pem
+
+  subject {
+    common_name = "${var.stepca_instance_name}-webhook"
+  }
+
+  dns_names    = ["localhost"]
+  ip_addresses = ["172.17.0.1"]
+}
+
+# Same permanent-audit-record caveat as the SCEP decrypter certificate above.
+resource "random_id" "webhook_cert_suffix" {
+  count       = var.enable_webhook ? 1 : 0
+  byte_length = 4
+  keepers = {
+    csr = tls_cert_request.webhook[0].cert_request_pem
+  }
+}
+
+resource "google_privateca_certificate" "webhook" {
+  count                 = var.enable_webhook ? 1 : 0
+  pool                  = var.ca_pool_name
+  location              = var.location
+  name                  = "${var.stepca_instance_name}-webhook-tls-${random_id.webhook_cert_suffix[0].hex}"
+  lifetime              = "7776000s" # 90 days; the VM re-reads it every few minutes
+  pem_csr               = tls_cert_request.webhook[0].cert_request_pem
+  certificate_authority = var.intermediate_ca_name
+}
+
+resource "google_secret_manager_secret" "webhook_tls_cert" {
+  count     = var.enable_webhook ? 1 : 0
+  secret_id = "${var.stepca_instance_name}-dtw-tls-cert"
+
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "webhook_tls_cert" {
+  count  = var.enable_webhook ? 1 : 0
+  secret = google_secret_manager_secret.webhook_tls_cert[0].id
+  secret_data = join("\n", concat(
+    [google_privateca_certificate.webhook[0].pem_certificate],
+    google_privateca_certificate.webhook[0].pem_certificate_chain,
+  ))
+}
+
+resource "google_secret_manager_secret" "webhook_tls_key" {
+  count     = var.enable_webhook ? 1 : 0
+  secret_id = "${var.stepca_instance_name}-dtw-tls-key"
+
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "webhook_tls_key" {
+  count       = var.enable_webhook ? 1 : 0
+  secret      = google_secret_manager_secret.webhook_tls_key[0].id
+  secret_data = tls_private_key.webhook[0].private_key_pem
+}
+
+# The device allowlist. Terraform writes the first version; an inventory sync
+# job can add newer versions and the VM picks up the latest one.
+resource "google_secret_manager_secret" "webhook_devices" {
+  count     = var.enable_webhook ? 1 : 0
+  secret_id = "${var.stepca_instance_name}-dtw-devices"
+
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "webhook_devices" {
+  count       = var.enable_webhook ? 1 : 0
+  secret      = google_secret_manager_secret.webhook_devices[0].id
+  secret_data = var.webhook_devices != "" ? var.webhook_devices : "# managed by terraform: add HOSTNAME,SERIAL lines\n"
+}
+
+resource "google_secret_manager_secret_iam_member" "webhook_accessor" {
+  for_each = var.enable_webhook ? {
+    tls_cert = google_secret_manager_secret.webhook_tls_cert[0].id
+    tls_key  = google_secret_manager_secret.webhook_tls_key[0].id
+    devices  = google_secret_manager_secret.webhook_devices[0].id
+  } : {}
+
+  secret_id = each.value
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.sa_stepca.email}"
+}
+
+# The webhook binary is too large for Secret Manager, so it is staged in a
+# bucket the VM's service account can read.
+resource "random_id" "webhook_bucket_suffix" {
+  count       = var.enable_webhook ? 1 : 0
+  byte_length = 4
+}
+
+resource "google_storage_bucket" "webhook" {
+  count                       = var.enable_webhook ? 1 : 0
+  name                        = "${var.stepca_instance_name}-dtw-${random_id.webhook_bucket_suffix[0].hex}"
+  location                    = var.location
+  uniform_bucket_level_access = true
+  force_destroy               = true
+}
+
+resource "google_storage_bucket_object" "webhook_binary" {
+  count  = var.enable_webhook ? 1 : 0
+  name   = "device-trust-webhook"
+  bucket = google_storage_bucket.webhook[0].name
+  source = var.webhook_binary_path
+
+  lifecycle {
+    precondition {
+      condition     = var.webhook_binary_path != "" && fileexists(var.webhook_binary_path)
+      error_message = "enable_webhook needs webhook_binary_path to point at a built linux/amd64 device-trust-webhook binary (cd webhook && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o device-trust-webhook .)."
+    }
+  }
+}
+
+resource "google_storage_bucket_iam_member" "webhook_binary_reader" {
+  count  = var.enable_webhook ? 1 : 0
+  bucket = google_storage_bucket.webhook[0].name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.sa_stepca.email}"
+}
+
+# The pinned keys are the only record of which key each host enrolled with, so
+# they live on their own small persistent disk.
+resource "google_compute_disk" "webhook_data" {
+  count = var.enable_webhook ? 1 : 0
+  name  = "${var.stepca_instance_name}-dtw-data"
+  type  = "pd-standard"
+  size  = 1
+  zone  = var.zone
+}
+
 # Allow Google's load balancer / health-check probes to reach the VM. The VM
 # has no external IP, so this is the only way in.
 resource "google_compute_firewall" "stepca_lb_health_check" {
@@ -151,35 +314,8 @@ resource "google_compute_firewall" "stepca_iap_ssh" {
   target_tags   = ["stepca"]
 }
 
-resource "google_compute_instance" "stepca" {
-  name         = var.stepca_instance_name
-  zone         = var.zone
-  machine_type = var.machine_type
-  tags         = ["stepca"]
-
-  boot_disk {
-    initialize_params {
-      image = "ubuntu-os-cloud/ubuntu-2204-lts"
-    }
-  }
-
-  network_interface {
-    network    = var.network_name
-    subnetwork = var.subnet_name
-    # No access_config: no external IP. The gateway LB reaches this VM over
-    # internal VPC connectivity.
-  }
-
-  service_account {
-    email  = google_service_account.sa_stepca.email
-    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
-  }
-
-  metadata = {
-    ca-json-secret-version       = google_secret_manager_secret_version.ca_json.name
-    stepca-password-secret-version = google_secret_manager_secret_version.stepca_password.name
-
-    startup-script = <<-EOT
+locals {
+  startup_head = <<-EOT
       #!/bin/bash
       set -e
 
@@ -204,6 +340,21 @@ resource "google_compute_instance" "stepca" {
       curl -s -H "Authorization: Bearer $TOKEN" \
         "https://secretmanager.googleapis.com/v1/$${PASSWORD_SECRET}:access" \
         | jq -r .payload.data | base64 -d > /etc/stepca/secrets/password
+  EOT
+
+  # The webhook is started before step-ca so it is ready for the first request.
+  startup_webhook = var.enable_webhook ? templatefile("${path.module}/templates/webhook-setup.sh.tftpl", {
+    bucket             = google_storage_bucket.webhook[0].name
+    object             = google_storage_bucket_object.webhook_binary[0].name
+    project_id         = var.project_id
+    devices_secret     = google_secret_manager_secret.webhook_devices[0].secret_id
+    tls_cert_secret    = google_secret_manager_secret.webhook_tls_cert[0].secret_id
+    tls_key_secret     = google_secret_manager_secret.webhook_tls_key[0].secret_id
+    enroll_provisioner = var.webhook_enroll_provisioner
+    renew_provisioner  = var.webhook_renew_provisioner
+  }) : ""
+
+  startup_tail = <<-EOT
 
       docker run -d --name step-ca --restart unless-stopped \
         -p ${var.stepca_port}:${var.stepca_port} \
@@ -211,6 +362,53 @@ resource "google_compute_instance" "stepca" {
         -v /etc/stepca/secrets:/home/step/secrets \
         ${var.stepca_container_image}
     EOT
+
+  startup_script = "${local.startup_head}${local.startup_webhook}${local.startup_tail}"
+}
+
+resource "google_compute_instance" "stepca" {
+  name         = var.stepca_instance_name
+  zone         = var.zone
+  machine_type = var.machine_type
+  tags         = ["stepca"]
+
+  # Attaching the webhook's data disk to an existing VM needs a stop/start. Only
+  # set with the webhook on, so the default configuration is unchanged.
+  allow_stopping_for_update = var.enable_webhook ? true : null
+
+  boot_disk {
+    initialize_params {
+      image = "ubuntu-os-cloud/ubuntu-2204-lts"
+    }
+  }
+
+  dynamic "attached_disk" {
+    for_each = google_compute_disk.webhook_data
+    content {
+      source      = attached_disk.value.id
+      device_name = "dtw-data"
+    }
+  }
+
+  network_interface {
+    network    = var.network_name
+    subnetwork = var.subnet_name
+    # No access_config: no external IP. The gateway LB reaches this VM over
+    # internal VPC connectivity.
+  }
+
+  service_account {
+    email  = google_service_account.sa_stepca.email
+    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+  }
+
+  metadata = {
+    ca-json-secret-version         = google_secret_manager_secret_version.ca_json.name
+    stepca-password-secret-version = google_secret_manager_secret_version.stepca_password.name
+
+    # HCL keeps carriage returns, so a CRLF checkout (git autocrlf on Windows)
+    # would leave "#!/bin/bash\r" and the script would not run. Strip them.
+    startup-script = replace(local.startup_script, "\r", "")
   }
 
   depends_on = [
@@ -218,6 +416,11 @@ resource "google_compute_instance" "stepca" {
     google_secret_manager_secret_version.ca_json,
     google_secret_manager_secret_iam_member.stepca_password_accessor,
     google_secret_manager_secret_version.stepca_password,
+    google_secret_manager_secret_iam_member.webhook_accessor,
+    google_secret_manager_secret_version.webhook_tls_cert,
+    google_secret_manager_secret_version.webhook_tls_key,
+    google_secret_manager_secret_version.webhook_devices,
+    google_storage_bucket_iam_member.webhook_binary_reader,
   ]
 }
 

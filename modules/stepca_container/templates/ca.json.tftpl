@@ -7,14 +7,60 @@
     "provisioners": [
       {
         "type": "SCEP",
-        "name": "device-trust-scep",
+        "name": "${enroll_provisioner}",
         "forceCN": true,
+%{ if webhook_enabled ~}
+        "options": {
+          "webhooks": [
+            {
+              "name": "device-trust-webhook-enroll",
+              "url": "${webhook_url}",
+              "kind": "SCEPCHALLENGE",
+              "certType": "X509"
+            }
+          ]
+        },
+%{ else ~}
         "challenge": "${scep_challenge}",
+%{ endif ~}
+%{ if cert_lifetime != "" ~}
+        "claims": {
+          "minTLSCertDuration": "5m",
+          "maxTLSCertDuration": "${cert_lifetime}",
+          "defaultTLSCertDuration": "${cert_lifetime}"
+        },
+%{ endif ~}
         "minimumPublicKeyLength": 2048,
         "encryptionAlgorithmIdentifier": 2,
         "decrypterCertificate": "${decrypter_cert_b64}",
         "decrypterKeyPEM": "${decrypter_key_b64}"
-      }
+      }%{ if webhook_enabled },
+      {
+        "type": "SCEP",
+        "name": "${renew_provisioner}",
+        "forceCN": true,
+        "options": {
+          "webhooks": [
+            {
+              "name": "device-trust-webhook-renew",
+              "url": "${webhook_url}",
+              "kind": "SCEPCHALLENGE",
+              "certType": "X509"
+            }
+          ]
+        },
+%{ if cert_lifetime != "" ~}
+        "claims": {
+          "minTLSCertDuration": "5m",
+          "maxTLSCertDuration": "${cert_lifetime}",
+          "defaultTLSCertDuration": "${cert_lifetime}"
+        },
+%{ endif ~}
+        "minimumPublicKeyLength": 2048,
+        "encryptionAlgorithmIdentifier": 2,
+        "decrypterCertificate": "${decrypter_cert_b64}",
+        "decrypterKeyPEM": "${decrypter_key_b64}"
+      }%{ endif }
     ]
   }
 }

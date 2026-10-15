@@ -102,3 +102,13 @@ docker-compose*
 # Terraform Cloud
 .tfc/
 .tfc/
+
+# Webhook server (webhook/)
+!webhook/README.md
+webhook/*.db
+webhook/*.db-*
+/webhook/device-trust-webhook
+/webhook/device-trust-webhook.exe
+
+# ignore the blog
+blog/

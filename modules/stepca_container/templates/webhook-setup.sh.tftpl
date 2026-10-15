@@ -1,0 +1,102 @@
+
+# ---- device-trust-webhook: per-device SCEP challenges (see webhook/README.md) ----
+# Runs on the host, listening on the Docker bridge address so the step-ca
+# container can reach it as https://172.17.0.1:8081. Nothing outside the VM can.
+mkdir -p /opt/dtw /etc/dtw /var/lib/dtw
+
+# The pinned keys live on a separate persistent disk so recreating the VM
+# does not make every host enroll again.
+DISK=/dev/disk/by-id/google-dtw-data
+if ! blkid "$DISK" >/dev/null 2>&1; then
+  mkfs.ext4 -F "$DISK"
+fi
+grep -q " /var/lib/dtw " /etc/fstab || echo "$DISK /var/lib/dtw ext4 defaults,nofail 0 2" >> /etc/fstab
+mount -a
+
+curl -sf -H "Authorization: Bearer $TOKEN" \
+  "https://storage.googleapis.com/storage/v1/b/${bucket}/o/${object}?alt=media" \
+  -o /opt/dtw/device-trust-webhook.new
+chmod 755 /opt/dtw/device-trust-webhook.new
+mv /opt/dtw/device-trust-webhook.new /opt/dtw/device-trust-webhook
+
+# Pulls the allowlist and the webhook's TLS certificate from Secret Manager.
+# Run at boot and every few minutes, so a new allowlist version (for example
+# from an inventory sync job) or a renewed certificate is picked up without a
+# restart: the server re-reads both files when they change.
+cat > /usr/local/bin/dtw-refresh <<'REFRESH'
+#!/bin/bash
+set -e
+TOKEN=$(curl -s -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
+  | jq -r .access_token)
+fetch() {
+  curl -sf -H "Authorization: Bearer $TOKEN" \
+    "https://secretmanager.googleapis.com/v1/projects/${project_id}/secrets/$1/versions/latest:access" \
+    | jq -r .payload.data | base64 -d > "$2.new"
+  chmod "$3" "$2.new"
+  mv "$2.new" "$2"
+}
+fetch ${devices_secret} /etc/dtw/devices.csv 644
+fetch ${tls_cert_secret} /etc/dtw/tls.crt 644
+fetch ${tls_key_secret} /etc/dtw/tls.key 600
+REFRESH
+chmod 755 /usr/local/bin/dtw-refresh
+/usr/local/bin/dtw-refresh
+
+# Admin wrapper: sudo dtw phrase new|add|list|revoke, uses ..., pins ...
+cat > /usr/local/bin/dtw <<'WRAP'
+#!/bin/sh
+exec env DTW_DB=/var/lib/dtw/webhook.db /opt/dtw/device-trust-webhook "$@"
+WRAP
+chmod 755 /usr/local/bin/dtw
+
+cat > /etc/systemd/system/dtw.service <<'UNIT'
+[Unit]
+Description=Device Trust SCEP challenge webhook
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+ExecStartPre=/bin/sh -c 'until ip -4 addr show docker0 | grep -q 172.17.0.1; do sleep 1; done'
+ExecStart=/opt/dtw/device-trust-webhook serve -listen 172.17.0.1:8081 -devices /etc/dtw/devices.csv -db /var/lib/dtw/webhook.db -tls-cert /etc/dtw/tls.crt -tls-key /etc/dtw/tls.key -enroll-provisioner ${enroll_provisioner} -renew-provisioner ${renew_provisioner} -no-signing-secret
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dtw
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /etc/systemd/system/dtw-refresh.service <<'UNIT'
+[Unit]
+Description=Refresh the webhook allowlist and TLS certificate
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dtw-refresh
+UNIT
+
+cat > /etc/systemd/system/dtw-refresh.timer <<'UNIT'
+[Unit]
+Description=Refresh the webhook allowlist and TLS certificate every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now dtw.service dtw-refresh.timer
+
+# On an existing VM the old step-ca container comes back with its old config as
+# soon as Docker starts at boot, before this script has rewritten ca.json, and
+# "docker run --name step-ca" below would then fail on the name. Remove it so
+# step-ca is recreated with the webhook configuration.
+docker rm -f step-ca >/dev/null 2>&1 || true
