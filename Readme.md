@@ -122,8 +122,15 @@ certificate exactly as they did before the webhook existed.
 | `KEY_PROTECTION` / `-KeyProtection` | `Delete` or `RestrictPermissions`. On Windows the default is `Delete`, as before. On macOS it is unset by default, which leaves the files as the script always has; set it to opt in (see the sections below) |
 | `SCEP_ATTEMPTS` / `-ScepAttempts` | Tries per `scepclient` call, default 3 (it occasionally fails on its own signature) |
 
+`CERT_COUNTRY`, `CERT_ORGANIZATION` and `CERT_OU` default to `US`, `DeviceTrust` and `DeviceTrust` on all three scripts. (The Windows scripts used to have no defaults, and Windows PowerShell 5.1 then passed `scepclient` an empty `-ou`, which it rejects.) The server URL, provisioner name and root CA file are still required.
+
 If a renewal is refused and a phrase is set, the script falls back to
-enrolling with a new key. The challenge is never printed.
+enrolling with a new key. The challenge is never printed. Each run ends with a
+"What happened" block so you can check it without reading server logs: the
+action and provisioner, which kind of challenge was used (and the serial number
+it was built from), whether the webhook path was used, the certificate's serial
+number and validity, whether the public key is the same as the certificate it
+replaced, where the private key lives, and what the next run will do.
 
 **These scripts should be treated as a best-effort starting point, not a
 fully tested, hardened deliverable.** `install-windows.ps1` and
@@ -148,7 +155,11 @@ certificate-specific logic even runs. Always pass it, either as a local file
 root-ca.crt` as shown above) or a URL if you're hosting the PEM somewhere.
 
 Example (Windows PowerShell - run elevated, `-RootCaFile` is bound to env var
-`ROOT_CA_FILE`, **not** `ROOT_CA_FILE_SRC`):
+`ROOT_CA_FILE`, **not** `ROOT_CA_FILE_SRC`). If PowerShell refuses with "running
+scripts is disabled on this system", allow scripts for that window only with
+`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force` (it reverts
+when the window closes), or start the script with
+`powershell -NoProfile -ExecutionPolicy Bypass -File .\install-windows.ps1 ...`:
 
 ```powershell
 .\install-windows.ps1 `
@@ -414,6 +425,12 @@ This turns `device-trust-scep` into the enrollment provisioner, adds
 `device-trust-scep-renew`, and stops using the static challenge. Install
 scripts that still send it will be refused until they are updated, so roll it
 out deliberately. With `enable_webhook = false` (the default) nothing changes.
+
+If you turn it on for a deployment that already exists, run
+`gcloud compute instances reset step-ca --zone <zone>` once after the apply:
+Terraform updates the VM in place, but its startup script (which installs the
+webhook and recreates the step-ca container with the new configuration) only
+runs at boot. See `webhook/README.md` for details.
 
 ## Security Considerations
 

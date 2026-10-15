@@ -379,9 +379,12 @@ device_serial() {
         ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformSerialNumber/{print $4}'
     fi
 }
+normalized_serial() {
+    device_serial | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:lower:]' '[:upper:]'
+}
 phrase_challenge() {
     local serial
-    serial=$(device_serial | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:lower:]' '[:upper:]')
+    serial=$(normalized_serial)
     if [ -z "$serial" ]; then
         printf "${RED}Error: could not read this Mac's serial number to build the per-device challenge${NC}\n" >&2
         return 1
@@ -395,12 +398,15 @@ phrase_challenge() {
 ACTION=enroll
 ACTIVE_PROVISIONER="$SCEP_PROVISIONER"
 ACTIVE_CHALLENGE="$SCEP_CHALLENGE"
+CHALLENGE_NOTE="static SCEP_CHALLENGE (per-device challenges are not in use)"
 if [ -n "$SCEP_RENEW_PROVISIONER" ] && [ "$HAVE_KEY" -eq 1 ]; then
     ACTION=renew
     ACTIVE_PROVISIONER="$SCEP_RENEW_PROVISIONER"
     ACTIVE_CHALLENGE="not-used-for-renewal"      # the renewal path ignores it
+    CHALLENGE_NOTE="renewal with the key from the last run; no phrase or challenge is sent, the server checks the key against the one pinned at enrollment"
 elif [ -n "$SCEP_PHRASE" ]; then
     ACTIVE_CHALLENGE=$(phrase_challenge)
+    CHALLENGE_NOTE="per-device challenge from this Mac's serial number $(normalized_serial) (HMAC-SHA256 keyed by the phrase; the phrase and the challenge are not shown)"
 fi
 
 # scepclient caches its CSR - challenge included - next to the key and silently
@@ -439,6 +445,7 @@ run_scepclient() {
 }
 
 echo "Action: $ACTION via provisioner $ACTIVE_PROVISIONER (the challenge itself is not printed)"
+echo "Challenge: $CHALLENGE_NOTE"
 echo "Command:"
 echo "$SCEPTOOL" -private-key "$PRIVATE_KEY_FILE" -certificate "$CERT_FILE" -server-url "${SCEP_SERVER_URL}/scep/${ACTIVE_PROVISIONER}" -challenge "<redacted>" -dnsname "$DNS_NAME" -cn "$COMMON_NAME" -country "$CERT_COUNTRY" -organization "$CERT_ORGANIZATION" -ou "$CERT_OU"
 
@@ -471,6 +478,8 @@ SCEP_EXIT=$?
 if [ $SCEP_EXIT -ne 0 ] && [ "$ACTION" = "renew" ] && [ -n "$SCEP_PHRASE" ]; then
     printf "${YELLOW}Renewal was refused - enrolling with a new key and the phrase instead.${NC}\n"
     ACTION=enroll
+    ACTIVE_PROVISIONER="$SCEP_PROVISIONER"
+    CHALLENGE_NOTE="per-device challenge from this Mac's serial number $(normalized_serial) (fallback after the renewal was refused)"
     FALLBACK_DIR=$(sudo -u "$TARGET_USER" mktemp -d "${CERT_DIR}/enroll-work.XXXXXX")
     FALLBACK_CHALLENGE=$(phrase_challenge)
     run_scepclient "$FALLBACK_DIR/client.key" "$FALLBACK_DIR/client.crt" "$SCEP_PROVISIONER" "$FALLBACK_CHALLENGE"
@@ -503,6 +512,8 @@ if [ $SCEP_EXIT -ne 0 ]; then
     fi
     exit 1
 fi
+
+printf "${GREEN}SCEP server issued the certificate (action: %s, provisioner: %s)${NC}\n" "$ACTION" "$ACTIVE_PROVISIONER"
 
 # Verify certificate was created
 if [ ! -f "$CERT_FILE" ]; then
@@ -554,6 +565,9 @@ cat "$CERT_FILE" >> "$FULL_CHAIN_FILE"
 # SHA-256 hash (not SHA-1) is used for `-Z` to match the confirmed-working
 # example exactly.
 OLD_CERT_HASHES=$(sudo -u "$TARGET_USER" security find-certificate -a -Z -c "$HOSTNAME" -p "$LOGIN_KEYCHAIN" 2>/dev/null | grep "SHA-256 hash:" | awk '{print $NF}')
+# Public key of the first earlier certificate, so the summary can say whether this
+# run kept the key. Empty when there is none.
+PREV_KEY_HASH=$(sudo -u "$TARGET_USER" security find-certificate -a -c "$HOSTNAME" -p "$LOGIN_KEYCHAIN" 2>/dev/null | openssl x509 -noout -pubkey 2>/dev/null | openssl sha256 2>/dev/null | awk '{print $NF}' | cut -c1-16 || true)
 
 # Package the cert+key(+chain) into a PKCS#12 bundle and import it into the
 # user's own login keychain - that's what Safari/Chrome actually consult
@@ -701,6 +715,17 @@ fi
 # Apply the chosen key protection to the loose PEM files. This comes after the
 # mTLS test because that test uses the PEM files directly.
 CERT_SUBJECT=$(openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | sed 's/subject= *//')
+CERT_SERIAL=$(openssl x509 -in "$CERT_FILE" -noout -serial 2>/dev/null | cut -d= -f2)
+CERT_NOT_BEFORE=$(openssl x509 -in "$CERT_FILE" -noout -startdate 2>/dev/null | cut -d= -f2)
+CERT_NOT_AFTER=$(openssl x509 -in "$CERT_FILE" -noout -enddate 2>/dev/null | cut -d= -f2)
+CERT_KEY_HASH=$(openssl x509 -in "$CERT_FILE" -noout -pubkey 2>/dev/null | openssl sha256 2>/dev/null | awk '{print $NF}' | cut -c1-16 || true)
+if [ -z "$PREV_KEY_HASH" ]; then
+    KEY_RELATION="no earlier certificate found in the keychain"
+elif [ "$PREV_KEY_HASH" = "$CERT_KEY_HASH" ]; then
+    KEY_RELATION="same key as the certificate it replaced"
+else
+    KEY_RELATION="new key"
+fi
 if [ -n "$KEY_PROTECTION" ]; then
     echo ""
     echo "Applying key protection mode: $KEY_PROTECTION"
@@ -722,6 +747,35 @@ echo "========================================"
 echo ""
 echo "Certificate installed in: ${TARGET_USER}'s login keychain (label: $CERT_SUBJECT)"
 echo "Full chain (public data): $FULL_CHAIN_FILE"
+
+# What this run actually did, in terms a person can check.
+case "$CHALLENGE_NOTE" in
+    static*) WEBHOOK_STATE="not used (static challenge)" ;;
+    *) WEBHOOK_STATE="used: the server accepted this request through the per-device flow" ;;
+esac
+if [ "$KEY_PROTECTION" = "Delete" ]; then
+    NEXT_RUN="enrolls again with a new key (needs a current phrase when the webhook is in use)"
+    KEY_STATE="non-exportable in the login keychain only; the key files were deleted"
+elif [ -n "$SCEP_RENEW_PROVISIONER" ]; then
+    NEXT_RUN="renews through $SCEP_RENEW_PROVISIONER with no phrase"
+else
+    NEXT_RUN="enrolls again with the same key (set SCEP_RENEW_PROVISIONER to renew without a phrase)"
+fi
+if [ "$KEY_PROTECTION" = "RestrictPermissions" ]; then
+    KEY_STATE="non-exportable in the login keychain; a copy is kept at $PRIVATE_KEY_FILE (mode 600, readable by ${TARGET_USER})"
+elif [ -z "$KEY_PROTECTION" ]; then
+    KEY_STATE="in the login keychain; a copy is kept at $PRIVATE_KEY_FILE with its default permissions"
+fi
+echo ""
+echo "What happened"
+echo "  Request:      $ACTION through provisioner $ACTIVE_PROVISIONER"
+echo "  Challenge:    $CHALLENGE_NOTE"
+echo "  Webhook:      $WEBHOOK_STATE"
+echo "  Device:       $HOSTNAME"
+echo "  Certificate:  serial $CERT_SERIAL, valid $CERT_NOT_BEFORE to $CERT_NOT_AFTER"
+echo "  Public key:   sha256 $CERT_KEY_HASH ($KEY_RELATION)"
+echo "  Private key:  $KEY_STATE"
+echo "  Next run:     $NEXT_RUN"
 [ -n "$KEY_PROTECTION" ] && echo "Key protection: $KEY_PROTECTION"
 if [ -n "$MTLS_TEST_RESULT" ]; then
     echo "mTLS gateway test: $MTLS_TEST_RESULT"

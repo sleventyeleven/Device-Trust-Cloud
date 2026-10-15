@@ -96,26 +96,35 @@ They also:
 - **retry** a failed `scepclient` call, because `scepclient` occasionally fails on its own signature before the request reaches the webhook (see "Gotchas"). Retrying a request the webhook really refused is harmless; only an allowed request uses up a phrase.
 - **fall back to enrolling** when a renewal is refused and a phrase is set (for example an administrator cleared the host's pin), in a scratch directory so the current key and certificate stay in place until the new ones are issued; without a phrase they stop and say why.
 - **leave nothing behind on a failed first enrollment**: the key made for that attempt is removed, so a Delete-mode device doesn't keep a key it never got a certificate for.
-- **never print the challenge** (the command line they echo shows `<redacted>`).
+- **never print the challenge** (the command line they echo shows `<redacted>`), and end with a "What happened" block: the action and provisioner, the kind of challenge and the serial number it was built from, whether the webhook path was used, the certificate's serial number and validity, whether the key is the same as the one in the certificate it replaced, where the private key lives, and what the next run will do. The server side of the same event is `sudo dtw uses list` and `sudo dtw pins list`.
 
 ```bash
-# macOS, renewable key: the first run enrolls, later runs renew with no phrase
+# macOS settings every run needs (the script's defaults are placeholders)
 export SCEP_SERVER_URL=https://203.0.113.10 MTLS_GATEWAY_URL=https://203.0.113.20/
-export SCEP_RENEW_PROVISIONER=device-trust-scep-renew KEY_PROTECTION=RestrictPermissions
+export SCEP_PROVISIONER=device-trust-scep ROOT_CA_FILE_SRC="$PWD/root-ca.crt"
+export SCEP_RENEW_PROVISIONER=device-trust-scep-renew
+
+# renewable key: the first run enrolls, later runs renew with no phrase
+export KEY_PROTECTION=RestrictPermissions
 SCEP_PHRASE='Queen-Ate-Lamp-Wise-Smell' sudo -E ./install-macos.sh
 sudo -E ./install-macos.sh
 
-# macOS, delete after import (the default): every run enrolls with the cycle's phrase
-SCEP_PHRASE='...' sudo -E ./install-macos.sh
+# delete after import, on a Mac that keeps no key: every run enrolls with the cycle's phrase
+KEY_PROTECTION=Delete SCEP_PHRASE='...' sudo -E ./install-macos.sh
 ```
 
 ```powershell
 # Windows (elevated, or SYSTEM from the MDM)
+# If PowerShell says "running scripts is disabled on this system", allow it for this window only:
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+
 $env:SCEP_SERVER_URL = "https://203.0.113.10"
+$env:SCEP_PROVISIONER = "device-trust-scep"
+$env:ROOT_CA_FILE = ".\root-ca.crt"                 # install-windows.bat reads ROOT_CA_FILE_SRC instead
 $env:SCEP_RENEW_PROVISIONER = "device-trust-scep-renew"
 $env:SCEP_PHRASE = "Queen-Ate-Lamp-Wise-Smell"
 .\install-windows.ps1 -KeyProtection RestrictPermissions    # first run enrolls, later runs renew with no phrase
-.\install-windows.ps1 -KeyProtection Delete                 # every run enrolls, imports (NoExport), then deletes the key
+.\install-windows.ps1 -KeyProtection Delete                 # on a PC that keeps no key: enrolls, imports (NoExport), deletes the key
 ```
 
 `install-windows.bat` takes the same settings as environment variables (`set SCEP_PHRASE=...`).
@@ -150,6 +159,14 @@ EOT
 - issues the webhook a TLS certificate from your intermediate CA (step-ca trusts it for webhooks) and runs the webhook on the step-ca VM as a systemd service on the Docker bridge address `172.17.0.1:8081`, reachable only from the VM,
 - stores the allowlist and TLS material in Secret Manager; the VM re-reads them every 5 minutes,
 - keeps the database (phrases and pinned keys) on its own 1 GB persistent disk.
+
+**Turning it on for a deployment that already exists:** `terraform apply` updates the VM in place (it hot-attaches the data disk and replaces the `ca.json` secret version), but the startup script only runs at boot. After the apply, restart the VM once so it installs the webhook and recreates the step-ca container with the new configuration:
+
+```bash
+gcloud compute instances reset step-ca --zone us-central1-a
+```
+
+(The webhook part of the startup script removes the old `step-ca` container first. Without that, Docker restarts the old container at boot with its old configuration, before the script has rewritten `ca.json`, and `docker run --name step-ca` cannot create a second container with that name, so step-ca stays on the static challenge and refuses every request without calling the webhook.) Install scripts that still send the static challenge are refused from then on.
 
 ### Operating it
 
@@ -211,7 +228,7 @@ The last cycle tested the install scripts themselves against that rebuilt stack,
 - **`install-windows.ps1` and `install-windows.bat` on a real Windows Server 2022 VM** (running as SYSTEM): enroll with `RestrictPermissions`, renew with no phrase (same key, new serial, one certificate left in the store), one-time enroll with `Delete` (no key, certificate, CSR or signer file left on disk), a Delete-mode device refused when it tries to renew without a phrase, a pin cleared by an administrator followed by the script's fallback to a fresh enrollment, and a phrase that had already been used refused when a new key presented it. 55 of 57 checks passed first time; the two that did not were a wrong assumption in my test (see the next list), and the corrected test passed. After every successful run the certificate in the Windows store, which `PfxExport` refuses to export, authenticated against the mTLS gateway both through the script's own test and through an independent `HttpWebRequest`.
 - **`install-macos.sh` in a Linux container** with the real `scepclient` and stand-ins for `sudo`, `security`, `ioreg` and `step`: the same scenarios (30 checks), including the serial read from `ioreg` output and ClientAuth with the identity held in the emulated keychain after the loose key files were deleted.
 
-Checked in the earlier rebuild cycles: enrollment with a phrase then renewal with no phrase (new certificate and serial, same public key, 45 day lifetime, hostname as the only SAN, clientAuth in the extended key usage); refusals for a wrong phrase, the right phrase with the wrong serial, a host not on the allowlist, renewal with another host's key, renewal by a host that never enrolled, and certificates asking for another host's name, a lookalike domain, or a comma-injected second name; decommissioning by publishing a new allowlist secret version, with the VM's timer picking it up on its own; and a hard VM reset leaving the pins and single-use records intact. In the last cycle the decision log recorded 31 allows and 57 refusals.
+Checked in earlier rebuild cycles: enrollment with a phrase then renewal with no phrase (new certificate and serial, same public key, 45 day lifetime, hostname as the only SAN, clientAuth in the extended key usage); refusals for a wrong phrase, the right phrase with the wrong serial, a host not on the allowlist, renewal with another host's key, renewal by a host that never enrolled, and certificates asking for another host's name, a lookalike domain, or a comma-injected second name; decommissioning by publishing a new allowlist secret version, with the VM's timer picking it up on its own; and a hard VM reset leaving the pins and single-use records intact. In the last cycle the decision log recorded 31 allows and 57 refusals.
 
 What the tests taught me:
 

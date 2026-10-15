@@ -34,6 +34,9 @@ REM files but the store entry persists.
 set IS_RENEWAL=0
 for /f "delims=" %%i in ('powershell -NoProfile -Command "if (Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.FriendlyName -eq '%CERT_FRIENDLY_NAME%' }) { 'yes' } else { 'no' }"') do set RENEWAL_CHECK=%%i
 if "%RENEWAL_CHECK%"=="yes" set IS_RENEWAL=1
+REM Public key of the certificate this run will replace, so the summary can say whether the key was kept.
+set PREV_KEY_HASH=
+for /f "delims=" %%i in ('powershell -NoProfile -Command "$c = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.FriendlyName -eq '%CERT_FRIENDLY_NAME%' } | Select-Object -First 1; if ($c) { $sha = [Security.Cryptography.SHA256]::Create(); (([BitConverter]::ToString($sha.ComputeHash($c.PublicKey.EncodedKeyValue.RawData))) -replace '-','').Substring(0,16).ToLower() }"') do set PREV_KEY_HASH=%%i
 
 echo ========================================
 echo Device Trust Certificate Installation
@@ -59,6 +62,10 @@ REM Configuration
 set SCEP_SERVER_URL=%SCEP_SERVER_URL%
 set SCEP_PROVISIONER=%SCEP_PROVISIONER%
 set SCEP_CHALLENGE=%SCEP_CHALLENGE%
+REM Subject fields of the certificate; defaults match install-macos.sh.
+if not defined CERT_COUNTRY set CERT_COUNTRY=US
+if not defined CERT_ORGANIZATION set CERT_ORGANIZATION=DeviceTrust
+if not defined CERT_OU set CERT_OU=DeviceTrust
 set CERT_COUNTRY=%CERT_COUNTRY%
 set CERT_ORGANIZATION=%CERT_ORGANIZATION%
 set CERT_OU=%CERT_OU%
@@ -204,6 +211,7 @@ REM behaviour: one provisioner, the static challenge.
 set ACTION=enroll
 set ACTIVE_PROVISIONER=%SCEP_PROVISIONER%
 set ACTIVE_CHALLENGE=%SCEP_CHALLENGE%
+set CHALLENGE_NOTE=static SCEP_CHALLENGE - per-device challenges are not in use
 if defined SCEP_RENEW_PROVISIONER if "%HAVE_KEY%"=="1" goto :action_renew
 if defined SCEP_PHRASE (
     call :compute_challenge
@@ -213,15 +221,18 @@ if defined SCEP_PHRASE (
         exit /b 1
     )
     set ACTIVE_CHALLENGE=!COMPUTED_CHALLENGE!
+    set CHALLENGE_NOTE=per-device challenge from this PC's serial number !COMPUTED_SERIAL! - HMAC-SHA256 keyed by the phrase, the phrase and the challenge are not shown
 )
 goto :action_ready
 :action_renew
 set ACTION=renew
 set ACTIVE_PROVISIONER=%SCEP_RENEW_PROVISIONER%
 set ACTIVE_CHALLENGE=not-used-for-renewal
+set CHALLENGE_NOTE=renewal with the key from the last run - no phrase or challenge is sent, the server checks the key against the one pinned at enrollment
 :action_ready
 
 echo Action: %ACTION% via provisioner %ACTIVE_PROVISIONER% ^(the challenge itself is not printed^)
+echo Challenge: %CHALLENGE_NOTE%
 echo Command:
 echo "%SCEPTOOL%" -private-key "%PRIVATE_KEY_FILE%" -certificate "%CERT_FILE%" -server-url "%SCEP_SERVER_URL%/scep/%ACTIVE_PROVISIONER%" -challenge "<redacted>" -dnsname "%DNS_NAME%" -cn "%COMMON_NAME%" -country "%CERT_COUNTRY%" -organization "%CERT_ORGANIZATION%" -ou "%CERT_OU%"
 
@@ -253,6 +264,8 @@ if "%SCEP_FAILED%"=="1" if "%ACTION%"=="renew" if defined SCEP_PHRASE (
     set FALLBACK_DIR=%CERT_DIR%\enroll-%RANDOM%%RANDOM%
     mkdir "!FALLBACK_DIR!"
     call :compute_challenge
+    set ACTIVE_PROVISIONER=%SCEP_PROVISIONER%
+    set CHALLENGE_NOTE=per-device challenge from this PC's serial number !COMPUTED_SERIAL! - fallback after the renewal was refused
     call :run_scep "!FALLBACK_DIR!\client.key" "!FALLBACK_DIR!\client.crt" "%SCEP_PROVISIONER%" "!COMPUTED_CHALLENGE!"
     if not errorlevel 1 if exist "!FALLBACK_DIR!\client.crt" (
         move /y "!FALLBACK_DIR!\client.key" "%PRIVATE_KEY_FILE%" >nul
@@ -273,6 +286,8 @@ if "%SCEP_FAILED%"=="1" (
     pause
     exit /b 1
 )
+
+echo SCEP server issued the certificate ^(action: %ACTION%, provisioner: %ACTIVE_PROVISIONER%^)
 
 REM Verify certificate was created
 if not exist "%CERT_FILE%" (
@@ -387,6 +402,9 @@ echo.
 echo Certificate installed in: Cert:\CurrentUser\My ^(FriendlyName: %CERT_FRIENDLY_NAME%^)
 echo Full chain ^(public data^): %FULL_CHAIN_FILE%
 echo.
+echo What happened
+powershell -NoProfile -Command "$c = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.FriendlyName -eq '%CERT_FRIENDLY_NAME%' } | Sort-Object NotBefore -Descending | Select-Object -First 1; if ($c) { $sha = [Security.Cryptography.SHA256]::Create(); $k = (([BitConverter]::ToString($sha.ComputeHash($c.PublicKey.EncodedKeyValue.RawData))) -replace '-','').Substring(0,16).ToLower(); $rel = if (-not $env:PREV_KEY_HASH) { 'first certificate on this PC' } elseif ($env:PREV_KEY_HASH -eq $k) { 'same key as the certificate it replaced' } else { 'new key' }; $web = if ($env:CHALLENGE_NOTE -like 'static*') { 'not used (static challenge)' } else { 'used: the server accepted this request through the per-device flow' }; $next = if ($env:KEY_PROTECTION -eq 'Delete') { 'enrolls again with a new key (needs a current phrase when the webhook is in use)' } elseif ($env:SCEP_RENEW_PROVISIONER) { 'renews through ' + $env:SCEP_RENEW_PROVISIONER + ' with no phrase' } else { 'enrolls again with the same key (set SCEP_RENEW_PROVISIONER to renew without a phrase)' }; $ks = if ($env:KEY_PROTECTION -eq 'Delete') { 'non-exportable in the certificate store only; the key files were deleted' } else { 'non-exportable in the certificate store; a copy is kept at ' + $env:PRIVATE_KEY_FILE + ', readable only by SYSTEM and Administrators' }; Write-Host ('  Request:      ' + $env:ACTION + ' through provisioner ' + $env:ACTIVE_PROVISIONER); Write-Host ('  Challenge:    ' + $env:CHALLENGE_NOTE); Write-Host ('  Webhook:      ' + $web); Write-Host ('  Device:       ' + $env:HOSTNAME); Write-Host ('  Certificate:  serial ' + $c.SerialNumber + ', valid ' + $c.NotBefore.ToString('yyyy-MM-dd') + ' to ' + $c.NotAfter.ToString('yyyy-MM-dd') + ', names: ' + ($c.DnsNameList.Unicode -join ', ')); Write-Host ('  Public key:   sha256 ' + $k + ' (' + $rel + ')'); Write-Host ('  Private key:  ' + $ks); Write-Host ('  Next run:     ' + $next) }"
+echo.
 
 pause
 goto :eof
@@ -394,11 +412,12 @@ goto :eof
 REM ---------------------------------------------------------------------------
 REM :compute_challenge - builds the per-device challenge from SCEP_PHRASE and this
 REM PC's serial number (DEVICE_SERIAL overrides the BIOS lookup for virtual
-REM machines and test rigs) into COMPUTED_CHALLENGE. The PowerShell has no inner
+REM machines and test rigs) into COMPUTED_CHALLENGE, and the serial it used into COMPUTED_SERIAL. The PowerShell has no inner
 REM double quotes so it survives the cmd quoting.
 :compute_challenge
 set COMPUTED_CHALLENGE=
-for /f "usebackq delims=" %%c in (`powershell -NoProfile -Command "$s = if ($env:DEVICE_SERIAL) { $env:DEVICE_SERIAL } else { (Get-CimInstance Win32_BIOS).SerialNumber }; $s = $s.Trim().ToUpperInvariant(); if (-not $s) { exit 1 }; $h = New-Object System.Security.Cryptography.HMACSHA256; $h.Key = [Text.Encoding]::UTF8.GetBytes($env:SCEP_PHRASE); [Convert]::ToBase64String($h.ComputeHash([Text.Encoding]::UTF8.GetBytes('device-trust-scep-challenge-v1' + [char]10 + $s)))"`) do set COMPUTED_CHALLENGE=%%c
+set COMPUTED_SERIAL=
+for /f "usebackq tokens=1,2 delims=|" %%a in (`powershell -NoProfile -Command "$s = if ($env:DEVICE_SERIAL) { $env:DEVICE_SERIAL } else { (Get-CimInstance Win32_BIOS).SerialNumber }; $s = $s.Trim().ToUpperInvariant(); if (-not $s) { exit 1 }; $h = New-Object System.Security.Cryptography.HMACSHA256; $h.Key = [Text.Encoding]::UTF8.GetBytes($env:SCEP_PHRASE); $s + '|' + [Convert]::ToBase64String($h.ComputeHash([Text.Encoding]::UTF8.GetBytes('device-trust-scep-challenge-v1' + [char]10 + $s)))"`) do (set COMPUTED_SERIAL=%%a& set COMPUTED_CHALLENGE=%%b)
 if not defined COMPUTED_CHALLENGE exit /b 1
 exit /b 0
 

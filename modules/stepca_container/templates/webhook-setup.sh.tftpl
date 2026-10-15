@@ -94,3 +94,9 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now dtw.service dtw-refresh.timer
+
+# On an existing VM the old step-ca container comes back with its old config as
+# soon as Docker starts at boot, before this script has rewritten ca.json, and
+# "docker run --name step-ca" below would then fail on the name. Remove it so
+# step-ca is recreated with the webhook configuration.
+docker rm -f step-ca >/dev/null 2>&1 || true
