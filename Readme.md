@@ -111,14 +111,15 @@ environment variables or (PowerShell only) named parameters - see
 `config.sh` for the full variable list and where each value comes from.
 
 All three scripts take the same four optional settings for the
-[per-device challenge webhook](#per-device-scep-challenges-optional), and
-behave exactly as before when they are unset:
+[per-device challenge webhook](#per-device-scep-challenges-optional). Every
+one is opt-in: with them unset the scripts request and install the
+certificate exactly as they did before the webhook existed.
 
 | Setting | Meaning |
 |---|---|
 | `SCEP_PHRASE` / `-ScepPhrase` | The current enrollment phrase. The script reads the device's serial number and computes the challenge itself (`DEVICE_SERIAL` overrides the lookup for virtual machines) |
 | `SCEP_RENEW_PROVISIONER` / `-RenewProvisioner` | The renewal provisioner (`device-trust-scep-renew`). Used instead of enrolling when the key from the last run is still on disk, so renewal needs no phrase |
-| `KEY_PROTECTION` / `-KeyProtection` | `Delete` (default) or `RestrictPermissions`; now on macOS too, see the sections below |
+| `KEY_PROTECTION` / `-KeyProtection` | `Delete` or `RestrictPermissions`. On Windows the default is `Delete`, as before. On macOS it is unset by default, which leaves the files as the script always has; set it to opt in (see the sections below) |
 | `SCEP_ATTEMPTS` / `-ScepAttempts` | Tries per `scepclient` call, default 3 (it occasionally fails on its own signature) |
 
 If a renewal is refused and a phrase is set, the script falls back to
@@ -253,7 +254,7 @@ option in the browser's certificate picker either - the ghosting is purely
 a Keychain Access display artifact. If it bothers you, it can be removed
 manually from Keychain Access, but there's no functional reason to.
 
-With the default `KEY_PROTECTION=Delete` every run makes a new key, and the
+With `KEY_PROTECTION=Delete` every run makes a new key, and the
 script removes the superseded *certificate* but not its private key, which
 stays in the keychain unused. It isn't offered for ClientAuth (there is no
 certificate to go with it), and it is non-exportable, but over many cycles
@@ -274,13 +275,13 @@ that process needs to write there without being root.
 
 ### macOS: the `KEY_PROTECTION` trade-off
 
-The macOS script has the same two modes as Windows, and `Delete` is the
-default there too. This changes what earlier versions did (they always kept
-the key): set `KEY_PROTECTION=RestrictPermissions` to get the old behaviour.
+The macOS script has the same two modes as Windows, but they are opt-in:
+with `KEY_PROTECTION` unset the script behaves as it always has and leaves the
+key and certificate in `~/.device-trust` with their default permissions.
 
 | Mode | Behavior | Trade-off |
 |---|---|---|
-| `Delete` (default) | After the mTLS test, removes `client.key`, `client.crt`, `csr.pem` and `self.pem` from `~/.device-trust`; the identity lives only in the login keychain, imported with `-x` | The next run has no key to reuse, so it is a new enrollment with a new key and needs a phrase (with the webhook) |
+| `Delete` | After the mTLS test, removes `client.key`, `client.crt`, `csr.pem` and `self.pem` from `~/.device-trust`; the identity lives only in the login keychain, imported with `-x` | The next run has no key to reuse, so it is a new enrollment with a new key and needs a phrase (with the webhook) |
 | `RestrictPermissions` | Keeps `client.key` in `~/.device-trust` (directory mode 700, key mode 600) | Same-key renewal with no phrase. **The key stays readable by the logged-in user**, because the script and `scepclient` run as that user, so unlike Windows this does not protect against the user themselves, only against other accounts |
 
 The loose files are deleted after the mTLS test, which uses them, so a

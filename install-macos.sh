@@ -47,25 +47,27 @@ MTLS_GATEWAY_URL="${MTLS_GATEWAY_URL:-}"
 SCEP_PHRASE="${SCEP_PHRASE:-}"
 SCEP_RENEW_PROVISIONER="${SCEP_RENEW_PROVISIONER:-}"
 SCEP_ATTEMPTS="${SCEP_ATTEMPTS:-3}"
-# What to do with the loose private key once it is in the keychain (same two
-# modes, and same default, as install-windows.ps1 -KeyProtection):
+# What to do with the loose private key once it is in the keychain (the same two
+# modes as install-windows.ps1 -KeyProtection):
 #   Delete               Remove the key, certificate and cached CSR files after the
 #                        import. The key then lives only in the keychain
 #                        (non-exportable) and the next run is a full re-enrollment
-#                        with a new key. Default.
+#                        with a new key.
 #   RestrictPermissions  Keep the key (mode 600) so the next run can renew with the
 #                        same key. On macOS this does NOT hide the key from the
 #                        logged-in user: scepclient has to run as that user so it
 #                        can see the CA trust settings in their keychain, which
 #                        means the key must stay readable by them. Prefer Delete
 #                        for devices whose users you do not fully trust.
-KEY_PROTECTION="${KEY_PROTECTION:-Delete}"
+# Unset (the default) leaves the files exactly as this script always has: the key
+# and certificate stay in $CERT_DIR with their default permissions.
+KEY_PROTECTION="${KEY_PROTECTION:-}"
 # Testing / air-gapped use: reuse scepclient and step already installed in
 # $INSTALL_DIR instead of downloading the latest releases every run.
 SKIP_TOOL_DOWNLOAD="${SKIP_TOOL_DOWNLOAD:-}"
 case "$KEY_PROTECTION" in
-    Delete|RestrictPermissions) ;;
-    *) printf "${RED}Error: KEY_PROTECTION must be Delete or RestrictPermissions (got '%s')${NC}\n" "$KEY_PROTECTION"; exit 1 ;;
+    ""|Delete|RestrictPermissions) ;;
+    *) printf "${RED}Error: KEY_PROTECTION must be Delete or RestrictPermissions, or unset (got '%s')${NC}\n" "$KEY_PROTECTION"; exit 1 ;;
 esac
 
 # This script needs root (via sudo -E) to write to /usr/local/bin, but the
@@ -150,7 +152,7 @@ echo "Configuration:"
 echo "- SCEP Server: $SCEP_SERVER_URL"
 echo "- Provisioner: $SCEP_PROVISIONER"
 [ -n "$SCEP_RENEW_PROVISIONER" ] && echo "- Renewal provisioner: $SCEP_RENEW_PROVISIONER"
-echo "- Key protection: $KEY_PROTECTION"
+[ -n "$KEY_PROTECTION" ] && echo "- Key protection: $KEY_PROTECTION"
 echo "- Hostname: $HOSTNAME"
 echo "- Architecture: $(uname -m) (using scepclient-darwin-${SCEP_ARCH})"
 echo "- Target user: $TARGET_USER"
@@ -699,12 +701,14 @@ fi
 # Apply the chosen key protection to the loose PEM files. This comes after the
 # mTLS test because that test uses the PEM files directly.
 CERT_SUBJECT=$(openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | sed 's/subject= *//')
-echo ""
-echo "Applying key protection mode: $KEY_PROTECTION"
+if [ -n "$KEY_PROTECTION" ]; then
+    echo ""
+    echo "Applying key protection mode: $KEY_PROTECTION"
+fi
 if [ "$KEY_PROTECTION" = "Delete" ]; then
     rm -f "$PRIVATE_KEY_FILE" "$CERT_FILE" "${CERT_DIR}/csr.pem" "${CERT_DIR}/self.pem"
     printf "${GREEN}Deleted the loose private key, certificate and cached CSR. The key now lives only in the keychain (non-exportable); the next run enrolls with a new key.${NC}\n"
-else
+elif [ "$KEY_PROTECTION" = "RestrictPermissions" ]; then
     chmod 700 "$CERT_DIR"
     chmod 600 "$PRIVATE_KEY_FILE"
     printf "${GREEN}Kept the key for same-key renewal, mode 600 in a mode 700 directory.${NC}\n"
@@ -718,7 +722,7 @@ echo "========================================"
 echo ""
 echo "Certificate installed in: ${TARGET_USER}'s login keychain (label: $CERT_SUBJECT)"
 echo "Full chain (public data): $FULL_CHAIN_FILE"
-echo "Key protection: $KEY_PROTECTION"
+[ -n "$KEY_PROTECTION" ] && echo "Key protection: $KEY_PROTECTION"
 if [ -n "$MTLS_TEST_RESULT" ]; then
     echo "mTLS gateway test: $MTLS_TEST_RESULT"
 fi

@@ -4,6 +4,8 @@ A small step-ca webhook that gives **every device its own SCEP challenge for enr
 
 It applies to the **GCP deployment** in this repository (step-ca in front of Google Cloud Private CA). The beta AWS support does not use step-ca.
 
+**This is entirely optional and off by default.** With `enable_webhook = false` (the default) the Terraform builds the same infrastructure as before, no webhook binary is needed, and the install scripts keep using the single static SCEP challenge. Nothing here runs unless you turn it on.
+
 ## Why
 
 With a static SCEP challenge in the MDM install script, anyone who can read the script on one endpoint (a compromised machine, or a curious user) can enroll any device they like, forever. Here the secret is a **short-lived phrase** that only matters at enrollment, and every challenge is bound to **one device's serial number**.
@@ -86,7 +88,7 @@ Non-exportability protects against a standard user, not against an administrator
 | --- | --- | --- |
 | `SCEP_PHRASE` | `-ScepPhrase` | the current enrollment phrase; the challenge sent is computed from this device's serial number (`ioreg` on macOS, `Win32_BIOS` on Windows; `DEVICE_SERIAL` overrides it for virtual machines and test rigs) |
 | `SCEP_RENEW_PROVISIONER` | `-RenewProvisioner` | the renewal provisioner (`device-trust-scep-renew`). When it is set and the key from the last run is still on disk, the run renews with that key and needs no phrase |
-| `KEY_PROTECTION` | `-KeyProtection` | `Delete` (the default, on all three scripts): import, then remove the key files, so every run is a new enrollment. `RestrictPermissions`: keep the key, locked down, for same-key renewal |
+| `KEY_PROTECTION` | `-KeyProtection` | `Delete`: import, then remove the key files, so every run is a new enrollment. `RestrictPermissions`: keep the key, locked down, for same-key renewal. Windows defaults to `Delete` as it always has; on macOS unset means the files are left as before |
 | `SCEP_ATTEMPTS` | `-ScepAttempts` | how often a failed `scepclient` call is tried (default 3) |
 
 They also:

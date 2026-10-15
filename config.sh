@@ -29,12 +29,13 @@ INTERMEDIATE_CA_FILE_SRC="${INTERMEDIATE_CA_FILE_SRC:-}"
 #   SCEP_RENEW_PROVISIONER: the webhook_renew_provisioner variable (default device-trust-scep-renew);
 #                           used when the key from the last run is still on disk
 #   SCEP_ATTEMPTS:          tries per scepclient call (default 3)
-#   KEY_PROTECTION:         Delete (default) or RestrictPermissions; only
+#   KEY_PROTECTION:         Delete or RestrictPermissions (unset leaves the files as the
+#                           script always has); only
 #                           RestrictPermissions leaves a key to renew with
 SCEP_PHRASE="${SCEP_PHRASE:-}"
 SCEP_RENEW_PROVISIONER="${SCEP_RENEW_PROVISIONER:-}"
 SCEP_ATTEMPTS="${SCEP_ATTEMPTS:-3}"
-KEY_PROTECTION="${KEY_PROTECTION:-Delete}"
+KEY_PROTECTION="${KEY_PROTECTION:-}"
 
 # Certificate Subject Configuration
 CERT_COUNTRY="${CERT_COUNTRY:-US}"

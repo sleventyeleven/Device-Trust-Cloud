@@ -372,8 +372,9 @@ resource "google_compute_instance" "stepca" {
   machine_type = var.machine_type
   tags         = ["stepca"]
 
-  # Attaching the webhook's data disk to an existing VM needs a stop/start.
-  allow_stopping_for_update = true
+  # Attaching the webhook's data disk to an existing VM needs a stop/start. Only
+  # set with the webhook on, so the default configuration is unchanged.
+  allow_stopping_for_update = var.enable_webhook ? true : null
 
   boot_disk {
     initialize_params {
